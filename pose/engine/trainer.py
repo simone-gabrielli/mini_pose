@@ -57,12 +57,22 @@ class Trainer:
         # Model
         model_cfg = cfg["model"]
         ModelCls = MODEL_REGISTRY[model_cfg["name"]]
-        self.model = ModelCls(
-            num_stacks=model_cfg.get("num_stacks", 2),
-            num_blocks=model_cfg.get("num_blocks", 1),
-            num_feats=model_cfg.get("num_feats", 256),
-            num_keypoints=num_keypoints,
-        ).to(self.device)
+
+        model_kwargs = {
+            "num_keypoints": num_keypoints,
+        }
+
+        if "num_stacks" in model_cfg:
+            model_kwargs["num_stacks"] = model_cfg["num_stacks"]
+        if "num_feats" in model_cfg:
+            model_kwargs["num_feats"] = model_cfg["num_feats"]
+        # support both stacked_hourglass (num_blocks) and FAN2D (num_modules)
+        if "num_blocks" in model_cfg:
+            model_kwargs["num_blocks"] = model_cfg["num_blocks"]
+        if "num_modules" in model_cfg:
+            model_kwargs["num_modules"] = model_cfg["num_modules"]
+
+        self.model = ModelCls(**model_kwargs).to(self.device)
 
         # Loss
         LossCls = LOSS_REGISTRY[cfg["loss"]["name"]]

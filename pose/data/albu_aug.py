@@ -84,7 +84,6 @@ class AlbumentationsKeypointPipeline:
 
         # Normalize and convert to tensor
         new_img = new_img.astype(np.float32) / 255.0
-        new_img = (new_img - 0.5) / 0.5
         new_img = new_img.transpose(2, 0, 1)
 
         return (

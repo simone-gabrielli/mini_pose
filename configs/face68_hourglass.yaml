@@ -16,13 +16,13 @@ data:
     rotation: 30      # FAN-like rotation
     scale: 0.25       # +/- scale range
     color_jitter: 0.10
-    hflip_prob: 0.5
+    hflip_prob: 0.0
 
 model:
-  name: stacked_hourglass
-  num_stacks: 4
-  num_blocks: 1
-  num_feats: 256
+  name: fan_2d
+  num_stacks: 4   # nStacks
+  num_modules: 1  # nModules
+  num_feats: 256  # nFeats
 
 loss:
   name: heatmap_mse
