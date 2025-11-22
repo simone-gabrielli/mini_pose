@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Checkpoints and model artifacts
+*.pth
+*.pt
+*.onnx
+*.ckpt
+checkpoints/
+work_dirs/
+outputs/
+runs/
+
+# Datasets (keep configs/scripts, ignore raw data)
+datasets/
+!datasets/.gitkeep
+
+# Training/inference temp files
+debug_out.png
+*.tmp
+
+# Build / packaging
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,22 @@
+# --- CORE VERSIONS ---
+torch==2.4.0
+torchvision==0.19.0
+
+# --- NUMPY ---
+# IMPORTANT: must stay < 2.0 or PyTorch on Windows breaks.
+numpy==1.26.4
+
+# --- IMAGING ---
+opencv-python==4.9.0.80
+
+# --- AUGMENTATIONS ---
+# Install without upgrading numpy
+albumentations==1.4.3
+
+# Albumentations dependencies (safe versions)
+scipy==1.12.0
+scikit-image==0.22.0
+
+# --- UTILS ---
+pyyaml==6.0.1
+tqdm==4.66.3
