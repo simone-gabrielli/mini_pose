@@ -7,18 +7,20 @@ data:
   val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
   input_size: [512, 512]
-  heatmap_size: [64, 64]
-  batch_size: 16
+  heatmap_size: [128, 128]
+  batch_size: 4
   num_workers: 0
   aug:
-    rotation: 10      # max degrees
-    scale: 0.10       # +/- scale range
+    use_bbox_crop: true
+    face_margin: 0.25
+    rotation: 30      # FAN-like rotation
+    scale: 0.25       # +/- scale range
     color_jitter: 0.10
     hflip_prob: 0.5
 
 model:
   name: stacked_hourglass
-  num_stacks: 2
+  num_stacks: 4
   num_blocks: 1
   num_feats: 256
 
@@ -26,10 +28,10 @@ loss:
   name: heatmap_mse
 
 train:
-  epochs: 5
+  epochs: 60
   lr: 0.00025
   weight_decay: 0.0001
   optimizer: "adam"
-  lr_steps: [30, 40]
+  lr_steps: [30, 50]
   lr_gamma: 0.1
-  output_dir: "work_dirs/face68_hourglass"
+  output_dir: "work_dirs/face68_hourglass_fan2d_like"

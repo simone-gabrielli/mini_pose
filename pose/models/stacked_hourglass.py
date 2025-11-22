@@ -190,7 +190,11 @@ class StackedHourglass(PoseModel):
         H_img, W_img = img_np.shape[0], img_np.shape[1]
         scale_y = H_img / float(Hh)
         scale_x = W_img / float(Wh)
-        ax.scatter(kpts_pred[:, 0] * scale_x, kpts_pred[:, 1] * scale_y, c="red", s=5, label="pred")
+        kpts_pred_img = np.stack(
+            [kpts_pred[:, 0] * scale_x, kpts_pred[:, 1] * scale_y],
+            axis=1,
+        )
+        ax.scatter(kpts_pred_img[:, 0], kpts_pred_img[:, 1], c="red", s=5, label="pred")
 
         ax.axis("off")
         ax.legend(loc="upper right", fontsize=6)

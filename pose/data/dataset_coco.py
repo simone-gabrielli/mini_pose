@@ -9,7 +9,6 @@ import torch
 from torch.utils.data import Dataset
 
 from pose.data.heatmap import generate_heatmaps
-from pose.data.transforms import BasicTransform
 from pose.registry import register_dataset
 from pose.data.albu_aug import AlbumentationsKeypointPipeline
 
@@ -46,6 +45,12 @@ class CocoKeypointsDataset(Dataset):
         ]
 
         aug_cfg = aug_cfg or {}
+        # Optional: enable bbox-based cropping (FAN-style) during training.
+        # If enabled in the config (data.aug.use_bbox_crop: true), we will use
+        # the annotation bbox and expand it with a margin before applying
+        # augmentations.
+        self.use_bbox_crop = bool(aug_cfg.get("use_bbox_crop", False))
+        self.face_margin = float(aug_cfg.get("face_margin", 0.25))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
             heatmap_size=heatmap_size,
@@ -65,13 +70,36 @@ class CocoKeypointsDataset(Dataset):
         file_name = image_info["file_name"]
         img_path = os.path.join(self.image_root, file_name)
 
-        img = cv2.imread(img_path)
-        if img is None:
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
             raise FileNotFoundError(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        # Base keypoints in original image coords
         kpts = np.array(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
         bbox = ann.get("bbox", None)
+
+        # Optional bbox-based crop: use COCO bbox as face box and expand.
+        if self.use_bbox_crop and bbox is not None:
+            x, y, w, h = bbox
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            size = max(w, h) * (1.0 + self.face_margin)
+            x1 = int(cx - size / 2.0)
+            y1 = int(cy - size / 2.0)
+            x2 = int(cx + size / 2.0)
+            y2 = int(cy + size / 2.0)
+
+            H_orig, W_orig = img_bgr.shape[:2]
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(W_orig - 1, x2)
+            y2 = min(H_orig - 1, y2)
+
+            img_bgr = img_bgr[y1:y2, x1:x2]
+            kpts[:, 0] -= x1
+            kpts[:, 1] -= y1
+
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         img_t, kpts_t = self.transform(img, kpts, bbox)
 

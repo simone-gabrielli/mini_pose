@@ -141,39 +141,49 @@ class Trainer:
             for p in preds_all:
                 loss = loss + self.criterion(p, targets, visible)
 
-            # Compute metrics (e.g., PCK, NME) here if needed
-            coord_preds = []
-            coord_targets = []
+            # Optionally compute metrics (e.g., PCK, NME) if model outputs heatmaps
+            if preds_last.dim() == 4:  # (B, K, H, W)
+                coord_preds = []
+                coord_targets = []
 
-            # Decode preds to keypoints
-            for b in range(preds_last.size(0)):
-                hm = preds_last[b].cpu()  # (K,H,W)
-                K, H, W = hm.shape
-                h_flat = hm.view(K, -1)
-                idx = torch.argmax(h_flat, dim=1)
-                y = (idx // W).float().numpy()
-                x = (idx % W).float().numpy()
-                coords = np.stack([x, y], axis=1)
-                coord_preds.append(coords)
+                # image and heatmap sizes from dataset config
+                H_img, W_img = self.train_ds.input_size[1], self.train_ds.input_size[0]
+                H_hm, W_hm = self.train_ds.heatmap_size[1], self.train_ds.heatmap_size[0]
+                sx = W_hm / float(W_img)
+                sy = H_hm / float(H_img)
 
-                # targets: from batch['keypoints']
-                t = batch["keypoints"][b].cpu().numpy()[:, :2] / (256 / 64)  # adjust scaling
-                coord_targets.append(t)
+                for b in range(preds_last.size(0)):
+                    hm = preds_last[b].cpu()  # (K,H,W)
+                    K, H, W = hm.shape
+                    h_flat = hm.view(K, -1)
+                    idx = torch.argmax(h_flat, dim=1)
+                    y = (idx // W).float().numpy()
+                    x = (idx % W).float().numpy()
+                    coords = np.stack([x, y], axis=1)
+                    coord_preds.append(coords)
+
+                    # targets: from batch['keypoints'], scaled into heatmap space
+                    t = batch["keypoints"][b].cpu().numpy()[:, :2]
+                    t_hm = np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1)
+                    coord_targets.append(t_hm)
 
             running_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
-        coord_preds = np.stack(coord_preds)
-        coord_targets = np.stack(coord_targets)
-
-        pck = compute_pck(coord_preds, coord_targets)
-        nme = compute_nme(coord_preds, coord_targets)
-
         val_loss = running_loss / len(self.val_loader)
         self.log_metric("val", "loss", val_loss)
-        self.log_metric("val", "pck", float(pck))
-        self.log_metric("val", "nme", float(nme))
-        print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
+
+        # If we computed keypoint coords, also log PCK/NME
+        try:
+            coord_preds_arr = np.stack(coord_preds)
+            coord_targets_arr = np.stack(coord_targets)
+            pck = compute_pck(coord_preds_arr, coord_targets_arr)
+            nme = compute_nme(coord_preds_arr, coord_targets_arr)
+            self.log_metric("val", "pck", float(pck))
+            self.log_metric("val", "nme", float(nme))
+            print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
+        except Exception:
+            print(f"Val: loss={val_loss:.4f}")
 
         return val_loss
 
