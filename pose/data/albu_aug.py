@@ -9,8 +9,10 @@ class AlbumentationsKeypointPipeline:
                  input_size=(256, 256),
                  heatmap_size=(64, 64),
                  flip_pairs=None,
-                 rotation=40,
-                 scale=0.30,
+                 rotation=15,
+                 scale=0.10,
+                 color_jitter=0.15,
+                 hflip_prob=0.5,
                  bbox_safe=True):
         """
         flip_pairs: list of tuples for horizontal flip keypoint swapping
@@ -29,17 +31,15 @@ class AlbumentationsKeypointPipeline:
                     fit_output=False,
                     interpolation=cv2.INTER_LINEAR,
                     mode=cv2.BORDER_CONSTANT,
-                    p=1.0
+                    p=0.7,
                 ),
-                A.HorizontalFlip(
-                    p=0.5
-                ),
+                A.HorizontalFlip(p=hflip_prob),
                 A.ColorJitter(
-                    brightness=0.2,
-                    contrast=0.2,
-                    saturation=0.2,
-                    hue=0.1,
-                    p=0.6
+                    brightness=color_jitter,
+                    contrast=color_jitter,
+                    saturation=color_jitter,
+                    hue=color_jitter * 0.5,
+                    p=0.4,
                 ),
                 A.Resize(height=input_size[1], width=input_size[0]),
             ],

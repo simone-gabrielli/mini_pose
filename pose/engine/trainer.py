@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 import pose.data      # noqa: F401  # ensures datasets register
 import pose.models    # noqa: F401  # ensures models register
@@ -26,12 +27,14 @@ class Trainer:
             image_root=ds_cfg["image_root"],
             input_size=tuple(ds_cfg["input_size"]),
             heatmap_size=tuple(ds_cfg["heatmap_size"]),
+            aug_cfg=ds_cfg.get("aug", None),
         )
         self.val_ds = DatasetCls(
             json_path=ds_cfg["val_json"],
             image_root=ds_cfg["image_root"],
             input_size=tuple(ds_cfg["input_size"]),
             heatmap_size=tuple(ds_cfg["heatmap_size"]),
+            aug_cfg=ds_cfg.get("aug", None),
         )
 
         self.train_loader = DataLoader(
@@ -86,6 +89,17 @@ class Trainer:
         self.output_dir = train_cfg.get("output_dir", "work_dirs")
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # generic history: split -> metric_name -> list[float]
+        self.history = {"train": {}, "val": {}}
+
+    def log_metric(self, split: str, name: str, value: float):
+        """Log any scalar metric for train/val in a generic way."""
+        if split not in self.history:
+            self.history[split] = {}
+        if name not in self.history[split]:
+            self.history[split][name] = []
+        self.history[split][name].append(float(value))
+
     def train_epoch(self, epoch: int):
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [train]")
@@ -108,7 +122,9 @@ class Trainer:
             running_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
-        return running_loss / len(self.train_loader)
+        epoch_loss = running_loss / len(self.train_loader)
+        self.log_metric("train", "loss", epoch_loss)
+        return epoch_loss
 
     @torch.no_grad()
     def validate_epoch(self, epoch: int):
@@ -154,6 +170,9 @@ class Trainer:
         nme = compute_nme(coord_preds, coord_targets)
 
         val_loss = running_loss / len(self.val_loader)
+        self.log_metric("val", "loss", val_loss)
+        self.log_metric("val", "pck", float(pck))
+        self.log_metric("val", "nme", float(nme))
         print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
 
         return val_loss
@@ -171,6 +190,70 @@ class Trainer:
         )
         return path
 
+    def _save_training_report(self):
+        """Save a minimal, model-agnostic training report.
+
+        - Plots all scalar metrics logged in self.history as <metric>_curve.png.
+        - Optionally calls a task-specific visualize_sample hook for qualitative examples.
+        """
+        # 1) Plot all scalar metrics present in history
+        train_metrics = self.history.get("train", {})
+        val_metrics = self.history.get("val", {})
+        metric_names = sorted(set(train_metrics.keys()) | set(val_metrics.keys()))
+
+        for metric_name in metric_names:
+            fig, ax = plt.subplots(figsize=(6, 4))
+
+            if metric_name in train_metrics:
+                ax.plot(train_metrics[metric_name], label=f"train/{metric_name}")
+            if metric_name in val_metrics:
+                ax.plot(val_metrics[metric_name], label=f"val/{metric_name}")
+
+            ax.set_xlabel("epoch")
+            ax.set_ylabel(metric_name)
+            ax.set_title(metric_name)
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.output_dir, f"{metric_name}_curve.png"))
+            plt.close(fig)
+
+        # 2) Optional qualitative examples via a model-specific hook
+        self._save_qualitative_examples()
+
+    def _save_qualitative_examples(self):
+        """Ask the model to generate qualitative visualizations, if supported.
+
+        Models that want to participate should implement a method with
+        the following signature on the model instance:
+
+            def generate_sample_visualization(
+                self,
+                sample: Dict[str, Any],
+                out_path: str,
+                device: torch.device,
+            ) -> None:
+                ...  # run forward + draw/save visualization
+
+        Trainer remains model-agnostic and only orchestrates sampling
+        from the validation dataset and file naming.
+        """
+        generate_fn = getattr(self.model, "generate_sample_visualization", None)
+        if generate_fn is None:
+            return
+
+        if len(self.val_ds) == 0:
+            return
+
+        self.model.eval()
+        os.makedirs(os.path.join(self.output_dir, "viz"), exist_ok=True)
+
+        num_vis = min(4, len(self.val_ds))
+        with torch.no_grad():
+            for i in range(num_vis):
+                sample = self.val_ds[i]
+                out_path = os.path.join(self.output_dir, "viz", f"val_example_{i}.png")
+                generate_fn(sample, out_path, self.device)
+
     def run(self):
         best_val = float("inf")
         try:
@@ -186,5 +269,8 @@ class Trainer:
                     best_val = val_loss
                     self.save_checkpoint(epoch, best=True)
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint...")
+            print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint and report...")
             self.save_checkpoint(epoch, best=False)
+        finally:
+            # always try to save a small report (curves + a few images)
+            self._save_training_report()

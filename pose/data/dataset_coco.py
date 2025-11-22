@@ -23,6 +23,7 @@ class CocoKeypointsDataset(Dataset):
         input_size: Tuple[int, int] = (256, 256),
         heatmap_size: Tuple[int, int] = (64, 64),
         sigma: float = 2.0,
+        aug_cfg: dict | None = None,
     ):
         super().__init__()
         self.json_path = json_path
@@ -44,12 +45,15 @@ class CocoKeypointsDataset(Dataset):
             (48,54),(49,53),(50,52),(51,51),
         ]
 
+        aug_cfg = aug_cfg or {}
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
             heatmap_size=heatmap_size,
             flip_pairs=flip_pairs,
-            rotation=40,
-            scale=0.30,
+            rotation=aug_cfg.get("rotation", 15),
+            scale=aug_cfg.get("scale", 0.10),
+            color_jitter=aug_cfg.get("color_jitter", 0.15),
+            hflip_prob=aug_cfg.get("hflip_prob", 0.5),
         )
 
     def __len__(self):

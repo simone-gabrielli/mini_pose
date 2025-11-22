@@ -2,6 +2,8 @@
 
 import torch
 import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
 from .base import PoseModel
 from pose.registry import register_model
 
@@ -143,3 +145,55 @@ class StackedHourglass(PoseModel):
 
         # return last output (for inference) and all stacks for loss if needed
         return outputs[-1], outputs
+
+    # Optional: model-specific sample visualization hook used by Trainer
+    def generate_sample_visualization(self, sample, out_path: str, device: torch.device) -> None:
+        """Generate a qualitative visualization for a single sample.
+
+        This method is called by Trainer if present, but is not required
+        for using the model. It should not assume any particular dataset
+        beyond 'image' being a tensor and 'keypoints' (if present) being
+        keypoint coordinates in image space.
+        """
+        img = sample["image"].unsqueeze(0).to(device)  # (1, C, H, W)
+        kpts_gt = sample.get("keypoints")
+
+        with torch.no_grad():
+            last, _ = self(img)
+
+        hm = last[0].detach().cpu()  # (K, Hh, Wh)
+        K, Hh, Wh = hm.shape
+        h_flat = hm.view(K, -1)
+        idx = torch.argmax(h_flat, dim=1)
+        y = (idx // Wh).float().numpy()
+        x = (idx % Wh).float().numpy()
+        kpts_pred = np.stack([x, y], axis=1)  # (K, 2)
+
+        # convert normalized image tensor back to [0,1] RGB for plotting
+        img_np = sample["image"].detach().cpu().numpy()  # (C, H, W) in normalized space
+        # inverse of (img/255 - 0.5) / 0.5  ->  img = (x * 0.5 + 0.5) * 255
+        img_np = (img_np * 0.5 + 0.5)  # back to [0,1]
+        if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
+            img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
+        img_np = np.clip(img_np, 0.0, 1.0)
+
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.imshow(img_np)
+
+        # draw GT keypoints if available
+        if kpts_gt is not None:
+            kpts_gt_np = kpts_gt.detach().cpu().numpy()
+            if kpts_gt_np.shape[1] >= 2:
+                ax.scatter(kpts_gt_np[:, 0], kpts_gt_np[:, 1], c="lime", s=5, label="gt")
+
+        # scale predicted keypoints from heatmap resolution to image resolution
+        H_img, W_img = img_np.shape[0], img_np.shape[1]
+        scale_y = H_img / float(Hh)
+        scale_x = W_img / float(Wh)
+        ax.scatter(kpts_pred[:, 0] * scale_x, kpts_pred[:, 1] * scale_y, c="red", s=5, label="pred")
+
+        ax.axis("off")
+        ax.legend(loc="upper right", fontsize=6)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
