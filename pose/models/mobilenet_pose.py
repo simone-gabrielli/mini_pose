@@ -22,7 +22,7 @@ class MobileNetPose(PoseModel):
         self,
         num_keypoints: int,
         pretrained: bool = True,
-        deconv_channels=(256, 256, 256, 256),
+        deconv_channels=(256, 256, 256),
         deconv_kernel=4,
     ):
         super().__init__()

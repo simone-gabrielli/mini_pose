@@ -7,7 +7,7 @@ data:
   val_json: "datasets/300W-3D/annotations/val.json"
   image_root: "datasets/300W-3D"
   input_size: [256, 256]
-  heatmap_size: [128, 128]
+  heatmap_size: [64, 64]
   batch_size: 32
   num_workers: 0
   aug:
