@@ -54,23 +54,18 @@ class Trainer:
 
         num_keypoints = self.train_ds.num_keypoints
 
-        # Model
+        # Model: fully generic wiring.
+        # - `name` selects the model class from the registry.
+        # - all other keys are passed verbatim as kwargs, plus
+        #   `num_keypoints` injected by the trainer.
         model_cfg = cfg["model"]
         ModelCls = MODEL_REGISTRY[model_cfg["name"]]
 
-        model_kwargs = {
-            "num_keypoints": num_keypoints,
-        }
-
-        if "num_stacks" in model_cfg:
-            model_kwargs["num_stacks"] = model_cfg["num_stacks"]
-        if "num_feats" in model_cfg:
-            model_kwargs["num_feats"] = model_cfg["num_feats"]
-        # support both stacked_hourglass (num_blocks) and FAN2D (num_modules)
-        if "num_blocks" in model_cfg:
-            model_kwargs["num_blocks"] = model_cfg["num_blocks"]
-        if "num_modules" in model_cfg:
-            model_kwargs["num_modules"] = model_cfg["num_modules"]
+        model_kwargs = {"num_keypoints": num_keypoints}
+        for k, v in model_cfg.items():
+            if k == "name":
+                continue
+            model_kwargs[k] = v
 
         self.model = ModelCls(**model_kwargs).to(self.device)
 
@@ -288,6 +283,10 @@ class Trainer:
                 if is_best:
                     best_val = val_loss
                     self.save_checkpoint(epoch, best=True)
+
+                # periodically refresh qualitative visualizations
+                if epoch % 10 == 0:
+                    self._save_qualitative_examples()
         except KeyboardInterrupt:
             print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint and report...")
             self.save_checkpoint(epoch, best=False)
