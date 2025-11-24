@@ -1,0 +1,39 @@
+experiment: face68_mobilenet
+seed: 42
+
+data:
+  type: coco_keypoints
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  input_size: [256, 256]      # should match Albumentations + head stride
+  heatmap_size: [64, 64]
+  batch_size: 32               # can be higher than hourglass due to lower mem
+  num_workers: 0
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.25
+    rotation: 30
+    scale: 0.25
+    color_jitter: 0.10
+    hflip_prob: 0.5
+
+model:
+  name: mobilenet_pose
+  # model-specific kwargs passed from Trainer:
+  # we didn't include them in Trainer yet, but currently Trainer does:
+  #   ModelCls(..., num_keypoints=num_keypoints)
+  # If you want pretrained on ImageNet, keep as True in code above or
+  # later extend Trainer to pass extra config keys.
+
+loss:
+  name: heatmap_mse
+
+train:
+  epochs: 1000
+  lr: 0.0005
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [40, 50]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/face68_mobilenet"

@@ -6,9 +6,9 @@ data:
   train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
   val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
-  input_size: [512, 512]
-  heatmap_size: [128, 128]
-  batch_size: 4
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 16
   num_workers: 0
   aug:
     use_bbox_crop: true
@@ -28,8 +28,8 @@ loss:
   name: heatmap_mse
 
 train:
-  epochs: 60
-  lr: 0.00025
+  epochs: 800
+  lr: 0.001
   weight_decay: 0.0001
   optimizer: "adam"
   lr_steps: [30, 50]
