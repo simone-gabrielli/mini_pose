@@ -233,19 +233,11 @@ class Fan2D(PoseModel):
 
     # Optional: model-specific sample visualization hook used by Trainer
     def generate_sample_visualization(self, sample, out_path: str, device: torch.device) -> None:
-        """Generate a qualitative visualization for a single sample.
-
-        Matches the contract expected by Trainer: takes a dataset sample
-        (with at least 'image' and optionally 'keypoints'), runs a forward
-        pass, decodes heatmaps to keypoints, and overlays GT vs predicted
-        points on the cropped face image.
-        """
+        """Generate a qualitative visualization for a single sample, including heatmaps overlay."""
         img = sample["image"].unsqueeze(0).to(device)  # (1, C, H, W)
         kpts_gt = sample.get("keypoints")
-
         with torch.no_grad():
             last, _ = self(img)
-
         hm = last[0].detach().cpu()  # (K, Hh, Wh)
         K, Hh, Wh = hm.shape
         h_flat = hm.view(K, -1)
@@ -253,25 +245,30 @@ class Fan2D(PoseModel):
         y = (idx // Wh).float().numpy()
         x = (idx % Wh).float().numpy()
         kpts_pred = np.stack([x, y], axis=1)  # (K, 2)
-
-        # convert normalized image tensor back to [0,1] RGB for plotting
         img_np = sample["image"].detach().cpu().numpy()  # (C, H, W)
-        # if you switched to 0-1 normalization in Albumentations, this is
-        # already in [0,1]; if still using [-1,1], uncomment the next line:
-        # img_np = (img_np * 0.5 + 0.5)
         if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
             img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
         img_np = np.clip(img_np, 0.0, 1.0)
-
+        # Overlay all predicted heatmaps (sum and normalize)
+        heatmap_sum = hm.sum(axis=0)
+        if hasattr(heatmap_sum, 'numpy'):
+            heatmap_sum = heatmap_sum.numpy()
+        heatmap_sum = (heatmap_sum - heatmap_sum.min()) / (heatmap_sum.max() - heatmap_sum.min() + 1e-8)
+        import cv2
+        heatmap_resized = cv2.resize(heatmap_sum, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+        # Overlay heatmap on image
+        overlay = img_np.copy()
+        cmap = plt.get_cmap("jet")
+        heatmap_rgb = cmap(heatmap_resized)[:, :, :3]
+        alpha = 0.5
+        overlay = (1 - alpha) * overlay + alpha * heatmap_rgb
         fig, ax = plt.subplots(figsize=(4, 4))
-        ax.imshow(img_np)
-
+        ax.imshow(overlay)
         # draw GT keypoints if available
         if kpts_gt is not None:
             kpts_gt_np = kpts_gt.detach().cpu().numpy()
             if kpts_gt_np.shape[1] >= 2:
                 ax.scatter(kpts_gt_np[:, 0], kpts_gt_np[:, 1], c="lime", s=5, label="gt")
-
         # scale predicted keypoints from heatmap resolution to image resolution
         H_img, W_img = img_np.shape[0], img_np.shape[1]
         scale_y = H_img / float(Hh)
@@ -281,7 +278,6 @@ class Fan2D(PoseModel):
             axis=1,
         )
         ax.scatter(kpts_pred_img[:, 0], kpts_pred_img[:, 1], c="red", s=5, label="pred")
-
         ax.axis("off")
         ax.legend(loc="upper right", fontsize=6)
         fig.tight_layout()
