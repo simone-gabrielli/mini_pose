@@ -1,6 +1,7 @@
 # pose/engine/trainer.py
 
 import os
+import shutil
 from typing import Dict, Any
 import torch
 import numpy as np
@@ -94,8 +95,19 @@ class Trainer:
         self.output_dir = train_cfg.get("output_dir", "work_dirs")
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # Optional: persist the config used for this run into output_dir
+        # If the original config path is provided in cfg["_config_path"], copy it
+        cfg_path = cfg.get("_config_path")
+        if isinstance(cfg_path, str) and os.path.isfile(cfg_path):
+            try:
+                shutil.copy2(cfg_path, os.path.join(self.output_dir, os.path.basename(cfg_path)))
+            except Exception:
+                # best-effort; ignore failures so training is not blocked
+                pass
+
         # generic history: split -> metric_name -> list[float]
         self.history = {"train": {}, "val": {}}
+        self.start_epoch = 1  # default
 
     def log_metric(self, split: str, name: str, value: float):
         """Log any scalar metric for train/val in a generic way."""
@@ -269,10 +281,21 @@ class Trainer:
                 out_path = os.path.join(self.output_dir, "viz", f"val_example_{i}.png")
                 generate_fn(sample, out_path, self.device)
 
-    def run(self):
+    def _load_checkpoint(self, ckpt_path: str):
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "epoch" in ckpt:
+            self.start_epoch = ckpt["epoch"] + 1
+
+    def run(self, resume_path: str = None):
+        if resume_path is not None:
+            self._load_checkpoint(resume_path)
+
         best_val = float("inf")
         try:
-            for epoch in range(1, self.epochs + 1):
+            for epoch in range(self.start_epoch, self.epochs + 1):
                 train_loss = self.train_epoch(epoch)
                 val_loss = self.validate_epoch(epoch)
                 self.scheduler.step()
@@ -285,8 +308,7 @@ class Trainer:
                     self.save_checkpoint(epoch, best=True)
 
                 # periodically refresh qualitative visualizations
-                if epoch % 10 == 0:
-                    self._save_qualitative_examples()
+                self._save_qualitative_examples()
         except KeyboardInterrupt:
             print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint and report...")
             self.save_checkpoint(epoch, best=False)

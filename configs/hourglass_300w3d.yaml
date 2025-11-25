@@ -1,0 +1,37 @@
+experiment: fan_2d_300w3d
+seed: 1337
+
+data:
+  type: coco_keypoints
+  train_json: "datasets/300W-3D/annotations/train.json"
+  val_json: "datasets/300W-3D/annotations/val.json"
+  image_root: "datasets/300W-3D"
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 16
+  num_workers: 0
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.25
+    rotation: 30
+    scale: 0.25
+    color_jitter: 0.10
+    hflip_prob: 0.5
+
+model:
+  name: fan_2d
+  num_stacks: 4   # nStacks
+  num_modules: 1  # nModules
+  num_feats: 256  # nFeats
+
+loss:
+  name: heatmap_mse
+
+train:
+  epochs: 60
+  lr: 0.001
+  weight_decay: 0.0001
+  optimizer: "adam"
+  lr_steps: [30, 50]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/fan_2d_300w3d"
