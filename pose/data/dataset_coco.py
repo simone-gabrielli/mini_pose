@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
 
 from pose.data.heatmap import generate_heatmaps
 from pose.registry import register_dataset
@@ -21,7 +22,7 @@ class CocoKeypointsDataset(Dataset):
         image_root: str,
         input_size: Tuple[int, int] = (256, 256),
         heatmap_size: Tuple[int, int] = (64, 64),
-        sigma: float = 2.0,
+        sigma: float = 3.0,
         aug_cfg: dict | None = None,
     ):
         super().__init__()

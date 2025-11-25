@@ -15,7 +15,7 @@ def generate_heatmaps(
     keypoints,  # (K, 3) [x,y,vis]
     heatmap_size,  # (H,W)
     image_size,  # (H_img, W_img)
-    sigma=2.0
+    sigma=1.0
 ):
     num_kpts = keypoints.shape[0]
     H, W = heatmap_size
