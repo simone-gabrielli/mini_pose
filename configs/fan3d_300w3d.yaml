@@ -1,4 +1,4 @@
-experiment: mobilenet_300w3d
+experiment: fan3d_300w3d
 seed: 1337
 
 data:
@@ -8,7 +8,7 @@ data:
   image_root: "datasets/300W-3D"
   input_size: [256, 256]
   heatmap_size: [64, 64]
-  batch_size: 32
+  batch_size: 16
   num_workers: 0
   aug:
     use_bbox_crop: true
@@ -19,16 +19,21 @@ data:
     hflip_prob: 0.0
 
 model:
-  name: mobilenet_pose
+  name: fan3d
+  num_stacks: 4
+  num_modules: 1
+  num_feats: 256
+  depth_channels: 1
 
 loss:
   name: heatmap_mse
+  depth: depth_mse
 
 train:
-  epochs: 80
-  lr: 0.0005
+  epochs: 60
+  lr: 0.001
   weight_decay: 0.0001
-  optimizer: adam
-  lr_steps: [50, 70]
+  optimizer: "adam"
+  lr_steps: [30, 50]
   lr_gamma: 0.1
-  output_dir: "work_dirs/mobilenet_300w3d"
+  output_dir: "work_dirs/fan3d_300w3d"
