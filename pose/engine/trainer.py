@@ -109,6 +109,52 @@ class Trainer:
         self.history = {"train": {}, "val": {}}
         self.start_epoch = 1  # default
 
+    def _visualize_model_outputs(self, sample, out_path: str):
+        # Runs forward pass and saves overlay images with predicted heatmaps
+        self.model.eval()
+        imgs = sample["image"].unsqueeze(0).to(self.device)
+        keypts_gt = sample["keypoints"].cpu().numpy()
+
+        with torch.no_grad():
+            out = self.model(imgs)
+        if isinstance(out, tuple) and len(out)==4:
+            preds_last = out[1][-1]  # preds_all[-1]
+        else:
+            preds_last = out[1][-1]  # preds_all[-1]
+
+        hm = preds_last[0].cpu().numpy()  # shape (K, H_hm, W_hm)
+        img_np = sample["image"].cpu().numpy().transpose(1,2,0)
+
+        H_img, W_img = img_np.shape[0], img_np.shape[1]
+        H_hm, W_hm = hm.shape[1], hm.shape[2]
+        scale_x = W_img / W_hm
+        scale_y = H_img / W_hm
+
+        plt.figure(figsize=(4,4))
+        plt.imshow(img_np)
+        for k in range(hm.shape[0]):
+            hm_k = hm[k]
+            hm_k = hm_k / hm_k.max() if hm_k.max() > 0 else hm_k
+            hm_resized = plt.cm.jet(hm_k)
+            plt.imshow(hm_resized[..., :3], alpha=0.3)
+        xs = keypts_gt[:,0]
+        ys = keypts_gt[:,1]
+        plt.scatter(xs, ys, c='lime', s=5, label='gt')
+        # Predicted points:
+        coords_pred = []
+        for k in range(hm.shape[0]):
+            idx_flat = hm[k].reshape(-1).argmax()
+            y = idx_flat // W_hm
+            x = idx_flat % W_hm
+            coords_pred.append((x*scale_x, y*scale_y))
+        coords_pred = np.array(coords_pred)
+        plt.scatter(coords_pred[:,0], coords_pred[:,1], c='red', s=5, label='pred')
+        plt.legend(loc='upper right', fontsize=6)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+
     def log_metric(self, split: str, name: str, value: float):
         """Log any scalar metric for train/val in a generic way."""
         if split not in self.history:
@@ -125,12 +171,26 @@ class Trainer:
             imgs = batch["image"].to(self.device)
             targets = batch["heatmaps"].to(self.device)
             visible = batch["visible"].to(self.device)
+            depth_targets = batch.get("depth", None)
+            if depth_targets is not None:
+                depth_targets = depth_targets.to(self.device)
 
-            preds_last, preds_all = self.model(imgs)
-            loss = 0.0
-            # sum loss over stacks
-            for p in preds_all:
-                loss = loss + self.criterion(p, targets, visible)
+            out = self.model(imgs)
+            # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
+            if isinstance(out, tuple) and len(out) == 4:
+                preds_last, preds_all, depth_last, depth_all = out
+                loss = 0.0
+                for i in range(len(preds_all)):
+                    p = preds_all[i]
+                    loss += self.criterion(p, targets, visible)
+                    if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                        d = depth_all[i]
+                        loss += self.depth_criterion(d, depth_targets)
+            else:
+                preds_last, preds_all = out
+                loss = 0.0
+                for p in preds_all:
+                    loss += self.criterion(p, targets, visible)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -152,11 +212,25 @@ class Trainer:
             imgs = batch["image"].to(self.device)
             targets = batch["heatmaps"].to(self.device)
             visible = batch["visible"].to(self.device)
+            depth_targets = batch.get("depth", None)
+            if depth_targets is not None:
+                depth_targets = depth_targets.to(self.device)
 
-            preds_last, preds_all = self.model(imgs)
-            loss = 0.0
-            for p in preds_all:
-                loss = loss + self.criterion(p, targets, visible)
+            out = self.model(imgs)
+            if isinstance(out, tuple) and len(out) == 4:
+                preds_last, preds_all, depth_last, depth_all = out
+                loss = 0.0
+                for i in range(len(preds_all)):
+                    p = preds_all[i]
+                    loss += self.criterion(p, targets, visible)
+                    if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                        d = depth_all[i]
+                        loss += self.depth_criterion(d, depth_targets)
+            else:
+                preds_last, preds_all = out
+                loss = 0.0
+                for p in preds_all:
+                    loss += self.criterion(p, targets, visible)
 
             # Optionally compute metrics (e.g., PCK, NME) if model outputs heatmaps
             if preds_last.dim() == 4:  # (B, K, H, W)
@@ -271,6 +345,15 @@ class Trainer:
         if len(self.val_ds) == 0:
             return
 
+        # for i in range(num_vis):
+        #     sample = self.val_ds[i]
+        #     out_path = os.path.join(self.output_dir, "viz", f"val_example_{i}.png")
+        #     if hasattr(self.model, "generate_sample_visualization"):
+        #         generate_fn = self.model.generate_sample_visualization
+        #         generate_fn(sample, out_path, self.device)
+        #     else:
+        #         self._visualize_model_outputs(sample, out_path)
+
         self.model.eval()
         os.makedirs(os.path.join(self.output_dir, "viz"), exist_ok=True)
 
@@ -288,7 +371,6 @@ class Trainer:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if "epoch" in ckpt:
             self.start_epoch = ckpt["epoch"] + 1
-
     def run(self, resume_path: str = None):
         if resume_path is not None:
             self._load_checkpoint(resume_path)
