@@ -13,10 +13,10 @@ data:
   aug:
     use_bbox_crop: true
     face_margin: 0.25
-    rotation: 0
+    rotation: 30
     scale: 0.0
-    color_jitter: 0.0
-    hflip_prob: 0.0
+    color_jitter: 0.10
+    hflip_prob: 0.0 # BROKEN - DO NOT USE
 
 model:
   name: fan3d

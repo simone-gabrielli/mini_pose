@@ -366,11 +366,22 @@ class Trainer:
 
     def _load_checkpoint(self, ckpt_path: str):
         ckpt = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model"])
+
+        # 1) Model weights: allow missing / extra keys (e.g., new attention params)
+        self.model.load_state_dict(ckpt["model"], strict=False)
+
+        # 2) Optimizer: try to load, but fall back to fresh optimizer on mismatch
         if "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except ValueError as e:
+                print(f"Warning: could not load optimizer state ({e}); "
+                      f"reinitializing optimizer with current parameters.")
+
+        # 3) Resume epoch counter if present
         if "epoch" in ckpt:
             self.start_epoch = ckpt["epoch"] + 1
+
     def run(self, resume_path: str = None):
         if resume_path is not None:
             self._load_checkpoint(resume_path)

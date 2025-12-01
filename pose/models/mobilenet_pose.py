@@ -8,6 +8,45 @@ from pose.models.base import PoseModel
 from pose.registry import register_model
 
 
+class LandmarkChannelAttention(nn.Module):
+    """Lightweight attention over a subset of keypoint channels.
+
+    Expects heatmaps (B, K, H, W) and reweights only the channels
+    whose indices are listed in important_idx.
+    """
+
+    def __init__(self, num_kpts: int, reduction: int = 16, important_idx=None):
+        super().__init__()
+        if important_idx is None or len(important_idx) == 0:
+            important_idx = list(range(num_kpts))
+        self.num_kpts = num_kpts
+        self.important_idx = important_idx
+
+        hidden = max(1, len(self.important_idx) // reduction)
+        self.fc1 = nn.Linear(len(self.important_idx), hidden)
+        self.fc2 = nn.Linear(hidden, len(self.important_idx))
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, heatmaps: torch.Tensor) -> torch.Tensor:
+        # heatmaps: (B, K, H, W)
+        B, K, H, W = heatmaps.shape
+        # global average pooling per channel -> (B, K)
+        z = heatmaps.view(B, K, -1).mean(-1)
+        z_sub = z[:, self.important_idx]  # (B, K_sub)
+
+        s = self.fc1(z_sub)
+        s = self.relu(s)
+        s = self.fc2(s)
+        s = self.sigmoid(s)  # (B, K_sub)
+
+        # build full (B, K) weights: ones for non-selected, s for selected
+        w = torch.ones_like(z)
+        w[:, self.important_idx] = s
+        w = w.view(B, K, 1, 1)
+        return heatmaps * w
+
+
 @register_model("mobilenet_pose")
 class MobileNetPose(PoseModel):
     """
@@ -24,6 +63,7 @@ class MobileNetPose(PoseModel):
         pretrained: bool = True,
         deconv_channels=(256, 256, 256),
         deconv_kernel=4,
+        attention_landmarks=None,  # list of landmark indices to attend, or None
     ):
         super().__init__()
         self.num_keypoints = num_keypoints
@@ -45,6 +85,15 @@ class MobileNetPose(PoseModel):
             stride=1,
             padding=0,
         )
+
+        # Optional channel-wise attention over a subset of keypoints
+        if attention_landmarks is not None:
+            self.attention = LandmarkChannelAttention(
+                num_kpts=num_keypoints,
+                important_idx=attention_landmarks,
+            )
+        else:
+            self.attention = None
 
         # Init head weights
         self._init_weights()
@@ -87,6 +136,10 @@ class MobileNetPose(PoseModel):
         feat = self.deconv_layers(feat)  # (B, C, H_hm, W_hm) e.g. 64x64
         out = self.final_layer(feat)     # (B, K, H_hm, W_hm)
 
+        # Optional landmark-channel attention
+        if self.attention is not None:
+            out = self.attention(out)
+
         # To be compatible with your Trainer (expects last_pred, preds_all)
         return out, [out]
 
@@ -95,7 +148,8 @@ class MobileNetPose(PoseModel):
         """Generate a qualitative visualization for a single sample.
 
         Decodes the predicted heatmaps to keypoints and overlays them with
-        ground-truth keypoints (if available) on the input crop.
+        ground-truth keypoints (if available) on the input crop. Additionally
+        overlays the summed predicted heatmaps (jet colormap) on the image.
         """
         img = sample["image"].unsqueeze(0).to(device)  # (1, C, H, W)
         kpts_gt = sample.get("keypoints")
@@ -119,8 +173,21 @@ class MobileNetPose(PoseModel):
             img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
         img_np = np.clip(img_np, 0.0, 1.0)
 
+        # Overlay summed predicted heatmaps on the image (jet colormap)
+        heatmap_sum = hm.sum(axis=0)
+        if hasattr(heatmap_sum, "numpy"):
+            heatmap_sum = heatmap_sum.numpy()
+        heatmap_sum = (heatmap_sum - heatmap_sum.min()) / (heatmap_sum.max() - heatmap_sum.min() + 1e-8)
+        import cv2
+        heatmap_resized = cv2.resize(heatmap_sum, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+        cmap = plt.get_cmap("jet")
+        heatmap_rgb = cmap(heatmap_resized)[:, :, :3]
+
+        alpha = 0.5
+        overlay = (1 - alpha) * img_np + alpha * heatmap_rgb
+
         fig, ax = plt.subplots(figsize=(4, 4))
-        ax.imshow(img_np)
+        ax.imshow(overlay)
 
         # draw GT keypoints if available
         if kpts_gt is not None:
