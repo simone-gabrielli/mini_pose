@@ -1,4 +1,4 @@
-experiment: face68_hourglass
+experiment: xreal_fan3d
 seed: 42
 
 data:
@@ -19,19 +19,21 @@ data:
     hflip_prob: 0.0 # BROKEN - DO NOT USE
 
 model:
-  name: fan_2d
-  num_stacks: 4   # nStacks
-  num_modules: 1  # nModules
-  num_feats: 256  # nFeats
+  name: fan3d
+  num_stacks: 4
+  num_modules: 1
+  num_feats: 256
+  depth_channels: 1
 
 loss:
   name: heatmap_mse
+  depth: depth_mse
 
 train:
-  epochs: 800
+  epochs: 200
   lr: 0.001
   weight_decay: 0.0001
   optimizer: "adam"
   lr_steps: [30, 50]
   lr_gamma: 0.1
-  output_dir: "work_dirs/face68_hourglass_fan2d_like"
+  output_dir: "work_dirs/xreal_fan3d"
