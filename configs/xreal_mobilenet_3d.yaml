@@ -1,0 +1,38 @@
+experiment: xreal_mobilenet_3d
+seed: 42
+
+data:
+  type: coco_keypoints_3d
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  depth_bins: 16
+  batch_size: 32
+  num_workers: 0
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.25
+    rotation: 30
+    scale: 0.1
+    color_jitter: 0.10
+    hflip_prob: 0.0
+
+model:
+  name: mobilenet_pose_3d
+  depth_bins: 16
+  #attention_landmarks: [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+
+loss:
+  name: heatmap_3d_mse
+  aux_2d_weight: 1000.0
+
+train:
+  epochs: 400
+  lr: 0.0005
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [40, 50]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/xreal_mobilenet_3d"

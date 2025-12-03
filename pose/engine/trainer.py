@@ -23,19 +23,24 @@ class Trainer:
         # Dataset
         ds_cfg = cfg["data"]
         DatasetCls = DATASET_REGISTRY[ds_cfg["type"]]
-        self.train_ds = DatasetCls(
-            json_path=ds_cfg["train_json"],
+        common_kwargs = dict(
             image_root=ds_cfg["image_root"],
             input_size=tuple(ds_cfg["input_size"]),
             heatmap_size=tuple(ds_cfg["heatmap_size"]),
             aug_cfg=ds_cfg.get("aug", None),
         )
+
+        # Pass optional 3D-related kwargs if the dataset supports them
+        if "depth_bins" in ds_cfg:
+            common_kwargs["depth_bins"] = ds_cfg["depth_bins"]
+
+        self.train_ds = DatasetCls(
+            json_path=ds_cfg["train_json"],
+            **common_kwargs,
+        )
         self.val_ds = DatasetCls(
             json_path=ds_cfg["val_json"],
-            image_root=ds_cfg["image_root"],
-            input_size=tuple(ds_cfg["input_size"]),
-            heatmap_size=tuple(ds_cfg["heatmap_size"]),
-            aug_cfg=ds_cfg.get("aug", None),
+            **common_kwargs,
         )
 
         self.train_loader = DataLoader(
@@ -68,11 +73,22 @@ class Trainer:
                 continue
             model_kwargs[k] = v
 
+        # Provide dataset depth range to the model so z is in the same units as annotations
+        if hasattr(self.train_ds, "depth_range") and self.train_ds.depth_range is not None:
+            model_kwargs["depth_range"] = self.train_ds.depth_range
+        if hasattr(self.train_ds, "depth_mean") and self.train_ds.depth_mean is not None:
+            model_kwargs["depth_mean"] = self.train_ds.depth_mean
+
         self.model = ModelCls(**model_kwargs).to(self.device)
 
         # Loss
         LossCls = LOSS_REGISTRY[cfg["loss"]["name"]]
         self.criterion = LossCls().to(self.device)
+
+        # auxiliary 2D MSE for spatial heatmap supervision when using 3D volumetric loss
+        self._mse2d = torch.nn.MSELoss(reduction="mean")
+        # weight for 2D auxiliary loss (can be overridden in config)
+        self.aux_2d_weight = cfg.get("loss", {}).get("aux_2d_weight", 1.0)
 
         # Optimizer
         train_cfg = cfg["train"]
@@ -117,10 +133,16 @@ class Trainer:
 
         with torch.no_grad():
             out = self.model(imgs)
-        if isinstance(out, tuple) and len(out)==4:
-            preds_last = out[1][-1]  # preds_all[-1]
+
+        # prefer the model's primary output (out[0]) if present (2D heatmaps),
+        # otherwise fall back to preds_all[-1]
+        if isinstance(out, tuple):
+            if isinstance(out[0], torch.Tensor):
+                preds_last = out[0]
+            else:
+                preds_last = out[1][-1]
         else:
-            preds_last = out[1][-1]  # preds_all[-1]
+            preds_last = out
 
         hm = preds_last[0].cpu().numpy()  # shape (K, H_hm, W_hm)
         img_np = sample["image"].cpu().numpy().transpose(1,2,0)
@@ -128,7 +150,7 @@ class Trainer:
         H_img, W_img = img_np.shape[0], img_np.shape[1]
         H_hm, W_hm = hm.shape[1], hm.shape[2]
         scale_x = W_img / W_hm
-        scale_y = H_img / W_hm
+        scale_y = H_img / H_hm
 
         plt.figure(figsize=(4,4))
         plt.imshow(img_np)
@@ -169,7 +191,13 @@ class Trainer:
         running_loss = 0.0
         for batch in pbar:
             imgs = batch["image"].to(self.device)
-            targets = batch["heatmaps"].to(self.device)
+
+            # Use volumetric 3D heatmaps when training with 3D loss
+            if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
+                targets = batch["heatmaps_3d"].to(self.device)
+            else:
+                targets = batch["heatmaps"].to(self.device)
+
             visible = batch["visible"].to(self.device)
             depth_targets = batch.get("depth", None)
             if depth_targets is not None:
@@ -192,6 +220,18 @@ class Trainer:
                 for p in preds_all:
                     loss += self.criterion(p, targets, visible)
 
+                if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
+                    hm_targets = batch["heatmaps"].to(self.device)
+                    aux_loss = self._mse2d(preds_last, hm_targets)
+                    loss = loss + self.aux_2d_weight * aux_loss
+
+                # If we're using volumetric 3D loss, add an auxiliary 2D MSE
+                if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
+                    # preds_last is a 2D probabilistic heatmap (B,K,H,W)
+                    hm_targets = batch["heatmaps"].to(self.device)
+                    aux_loss = self._mse2d(preds_last, hm_targets)
+                    loss = loss + self.aux_2d_weight * aux_loss
+
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -210,7 +250,12 @@ class Trainer:
         running_loss = 0.0
         for batch in pbar:
             imgs = batch["image"].to(self.device)
-            targets = batch["heatmaps"].to(self.device)
+
+            if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
+                targets = batch["heatmaps_3d"].to(self.device)
+            else:
+                targets = batch["heatmaps"].to(self.device)
+
             visible = batch["visible"].to(self.device)
             depth_targets = batch.get("depth", None)
             if depth_targets is not None:
