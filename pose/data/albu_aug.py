@@ -7,18 +7,15 @@ import cv2
 class AlbumentationsKeypointPipeline:
     def __init__(self,
                  input_size=(256, 256),
-                 heatmap_size=(64, 64),
                  flip_pairs=None,
                  rotation=15,
                  scale=0.10,
                  color_jitter=0.15,
-                 hflip_prob=0.5,
                  bbox_safe=True):
         """
         flip_pairs: list of tuples for horizontal flip keypoint swapping
         """
         self.input_size = input_size
-        self.heatmap_size = heatmap_size
         self.flip_pairs = flip_pairs or []
 
         # Define Albumentations pipeline
@@ -33,7 +30,6 @@ class AlbumentationsKeypointPipeline:
                     mode=cv2.BORDER_CONSTANT,
                     p=0.7,
                 ),
-                A.HorizontalFlip(p=hflip_prob),
                 A.ColorJitter(
                     brightness=color_jitter,
                     contrast=color_jitter,
@@ -46,15 +42,6 @@ class AlbumentationsKeypointPipeline:
             keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
             additional_targets={"image2": "image"},
         )
-
-    def _swap_keypoints(self, kpts):
-        """
-        Swap keypoints after horizontal flip.
-        """
-        kpts = kpts.copy()
-        for a, b in self.flip_pairs:
-            kpts[[a, b]] = kpts[[b, a]]
-        return kpts
 
     def __call__(self, img, keypoints, bbox=None):
         # Albumentations uses (x,y); your keypoints array is (K,3)
@@ -72,11 +59,6 @@ class AlbumentationsKeypointPipeline:
         if augmented.get("replay", None):
             # Not used here, but available
             pass
-
-        # HorizontalFlip in Albumentations implicitly flips coords,
-        # but we must also swap L/R keypoints
-        if augmented.get("flipped", False):
-            new_kpts = self._swap_keypoints(new_kpts)
 
         # Preserve visibility in keypoints
         vis = keypoints[:, 2:3]

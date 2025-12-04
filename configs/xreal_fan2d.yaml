@@ -3,12 +3,12 @@ seed: 42
 
 data:
   type: coco_keypoints
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
   input_size: [256, 256]
   heatmap_size: [64, 64]
-  batch_size: 16
+  batch_size: 8
   num_workers: 0
   aug:
     use_bbox_crop: true
@@ -16,7 +16,6 @@ data:
     rotation: 30      # FAN-like rotation
     scale: 0.0
     color_jitter: 0.10
-    hflip_prob: 0.0 # BROKEN - DO NOT USE
 
 model:
   name: fan_2d

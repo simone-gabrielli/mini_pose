@@ -1,4 +1,4 @@
-experiment: xreal_fan3d
+experiment: xreal_fan3d_DEPRECATED
 seed: 42
 
 data:
@@ -7,16 +7,17 @@ data:
   val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
   input_size: [256, 256]
-  heatmap_size: [64, 64]
+  heatmap_size: [256, 256]
   batch_size: 16
   num_workers: 0
+  # sigma for GT Gaussian on heatmaps. Scale proportionally when increasing heatmap_size.
+  sigma: 5.0
   aug:
     use_bbox_crop: true
     face_margin: 0.25
     rotation: 30      # FAN-like rotation
     scale: 0.0
     color_jitter: 0.10
-    hflip_prob: 0.0 # BROKEN - DO NOT USE
 
 model:
   name: fan3d
@@ -36,4 +37,4 @@ train:
   optimizer: "adam"
   lr_steps: [30, 50]
   lr_gamma: 0.1
-  output_dir: "work_dirs/xreal_fan3d"
+  output_dir: "work_dirs/xreal_fan3d_DEPRECATED"

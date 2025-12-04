@@ -17,7 +17,6 @@ data:
     rotation: 30
     scale: 0.1
     color_jitter: 0.10
-    hflip_prob: 0.0
 
 model:
   name: mobilenet_pose_3d

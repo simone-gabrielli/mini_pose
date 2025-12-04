@@ -30,6 +30,12 @@ class Trainer:
             aug_cfg=ds_cfg.get("aug", None),
         )
 
+        # Optional: forward sigma from config into dataset so GT heatmaps
+        # are generated at the requested spatial resolution with matching sigma.
+        if "sigma" in ds_cfg:
+            common_kwargs["sigma"] = ds_cfg["sigma"]
+
+
         # Pass optional 3D-related kwargs if the dataset supports them
         if "depth_bins" in ds_cfg:
             common_kwargs["depth_bins"] = ds_cfg["depth_bins"]

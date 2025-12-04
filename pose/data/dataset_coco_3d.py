@@ -59,12 +59,10 @@ class CocoKeypoints3DDataset(Dataset):
         self.face_margin = float(aug_cfg.get("face_margin", 0.25))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
-            heatmap_size=heatmap_size,
             flip_pairs=flip_pairs,
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),
-            color_jitter=aug_cfg.get("color_jitter", 0.15),
-            hflip_prob=aug_cfg.get("hflip_prob", 0.5),
+            color_jitter=aug_cfg.get("color_jitter", 0.15)
         )
 
         # If depth_range not provided, compute a global range over the dataset
@@ -161,25 +159,13 @@ class CocoKeypoints3DDataset(Dataset):
         kpts3d_trans[:, 2] = kpts_3d[:, 2]
         kpts3d_trans[:, 3] = kpts_t.numpy()[:, 2]
 
-        heatmaps_3d = generate_heatmaps_3d(
-            kpts3d_trans,
-            heatmap_size=self.heatmap_size,
-            image_size=self.input_size,
-            depth_bins=self.depth_bins,
-            depth_range=self.depth_range,
-            sigma_spatial=self.sigma,
-            sigma_depth=1.0,
-        )
-
         heatmaps_2d_t = torch.from_numpy(heatmaps_2d)
-        heatmaps_3d_t = torch.from_numpy(heatmaps_3d)
         visible = (kpts_t[:, 2] > 0).float()
 
         return {
             "image": img_t,
             "keypoints": kpts_t,
             "heatmaps": heatmaps_2d_t,
-            "heatmaps_3d": heatmaps_3d_t,
             "visible": visible,
             "meta": {"image_path": img_path, "id": ann["image_id"]},
         }
