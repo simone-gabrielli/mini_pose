@@ -1,0 +1,26 @@
+experiment: face_mobilenet
+seed: 1337
+
+data:
+  type: coco_face
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 32
+  num_workers: 0
+
+model:
+  name: tiny_face
+  pretrained: true
+  embed_dim: 512
+
+train:
+  epochs: 100
+  lr: 0.0001
+  weight_decay: 0.0001
+  optimizer: "adam"
+  lr_steps: [20, 25]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/face_mobilenet"
