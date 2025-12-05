@@ -173,6 +173,15 @@ class Fan3D(PoseModel):
         img_np = sample["image"].detach().cpu().numpy()
         if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
             img_np = np.transpose(img_np, (1, 2, 0))
+
+        # Undo ImageNet normalization used by the dataset pipeline
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        try:
+            img_np = (img_np * std) + mean
+        except Exception:
+            pass
+
         img_np = np.clip(img_np, 0.0, 1.0)
         fig, ax = plt.subplots(figsize=(4, 4))
         ax.imshow(img_np)

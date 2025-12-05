@@ -169,12 +169,19 @@ class StackedHourglass(PoseModel):
         x = (idx % Wh).float().numpy()
         kpts_pred = np.stack([x, y], axis=1)  # (K, 2)
 
-        # convert normalized image tensor back to [0,1] RGB for plotting
-        img_np = sample["image"].detach().cpu().numpy()  # (C, H, W) in normalized space
-        # inverse of (img/255 - 0.5) / 0.5  ->  img = (x * 0.5 + 0.5) * 255
-        img_np = (img_np * 0.5 + 0.5)  # back to [0,1]
+        # convert tensor back to [0,1] RGB for plotting and undo dataset normalization
+        img_np = sample["image"].detach().cpu().numpy()  # (C, H, W)
         if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
             img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
+
+        # Undo ImageNet normalization used by the dataset pipeline
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        try:
+            img_np = (img_np * std) + mean
+        except Exception:
+            pass
+
         img_np = np.clip(img_np, 0.0, 1.0)
 
         fig, ax = plt.subplots(figsize=(4, 4))

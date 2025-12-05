@@ -230,6 +230,14 @@ class MobileNetPose3D(PoseModel):
         # preserve CPU image for drawing; we pass a copy to the helper
         img_np = img.cpu().numpy().transpose(1, 2, 0) if isinstance(img, torch.Tensor) else np.array(img)
 
+        # If dataset normalized images (ImageNet mean/std), undo it for visualization
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        try:
+            img_np = (img_np * std) + mean
+        except Exception:
+            pass
+
         # Forward
         with torch.no_grad():
             inp = (

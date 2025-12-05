@@ -48,18 +48,13 @@ class CocoKeypoints3DDataset(Dataset):
         self.annotations = coco["annotations"]
         self.num_keypoints = len(coco["categories"][0]["keypoints"])
 
-        flip_pairs = [
-            (36, 45), (37, 44), (38, 43), (39, 42), (40, 47), (41, 46),
-            (31, 35), (32, 34),
-            (48, 54), (49, 53), (50, 52), (51, 51),
-        ]
+        # flip_pairs removed — no automatic keypoint index swapping on flip
 
         aug_cfg = aug_cfg or {}
         self.use_bbox_crop = bool(aug_cfg.get("use_bbox_crop", False))
         self.face_margin = float(aug_cfg.get("face_margin", 0.25))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
-            flip_pairs=flip_pairs,
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),
             color_jitter=aug_cfg.get("color_jitter", 0.15)

@@ -167,10 +167,18 @@ class MobileNetPose(PoseModel):
 
         # convert tensor back to [0,1] RGB for plotting
         img_np = sample["image"].detach().cpu().numpy()  # (C, H, W)
-        # If using [-1,1] normalization, uncomment next line:
-        # img_np = (img_np * 0.5 + 0.5)
         if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
             img_np = np.transpose(img_np, (1, 2, 0))  # (H, W, C)
+
+        # Undo dataset normalization (ImageNet mean/std used in pipeline)
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        try:
+            img_np = (img_np * std) + mean
+        except Exception:
+            # if shapes mismatch, fall back to clipping the raw values
+            pass
+
         img_np = np.clip(img_np, 0.0, 1.0)
 
         # Overlay summed predicted heatmaps on the image (jet colormap)

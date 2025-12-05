@@ -16,6 +16,15 @@ data:
     rotation: 30
     scale: 0.0
     color_jitter: 0.10
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.5
+      sunflare_p: 0.15
+      motion_blur_p: 0.15
+      gauss_noise_p: 0.2
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
 
 model:
   name: fan_2d

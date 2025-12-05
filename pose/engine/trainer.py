@@ -153,6 +153,14 @@ class Trainer:
         hm = preds_last[0].cpu().numpy()  # shape (K, H_hm, W_hm)
         img_np = sample["image"].cpu().numpy().transpose(1,2,0)
 
+        # Undo dataset normalization (ImageNet mean/std used in pipeline)
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        try:
+            img_np = (img_np * std) + mean
+        except Exception:
+            pass
+
         H_img, W_img = img_np.shape[0], img_np.shape[1]
         H_hm, W_hm = hm.shape[1], hm.shape[2]
         scale_x = W_img / W_hm

@@ -16,7 +16,15 @@ data:
     rotation: 30
     scale: 0.1
     color_jitter: 0.10
-    aug_factor: 3
+    aug_factor: 2
+    content:
+      brightness_contrast_p: 0.5
+      sunflare_p: 0.1
+      motion_blur_p: 0.1
+      gauss_noise_p: 0.2
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
 
 model:
   name: mobilenet_pose
@@ -26,13 +34,13 @@ model:
   # If you want pretrained on ImageNet, keep as True in code above or
   # later extend Trainer to pass extra config keys.
   # Optional: enable landmark-channel attention on a subset of keypoints.
-  attention_landmarks: [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47] # Glasses
+  # attention_landmarks: [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47] # Glasses
 
 loss:
   name: heatmap_mse
 
 train:
-  epochs: 1000
+  epochs: 400
   lr: 0.0005
   weight_decay: 0.0001
   optimizer: adam

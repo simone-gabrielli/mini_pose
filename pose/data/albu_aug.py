@@ -21,14 +21,25 @@ class AlbumentationsKeypointPipeline:
     def __init__(
         self,
         input_size=(256, 256),
-        flip_pairs=None,
+        # `flip_pairs` removed — pipeline no longer performs keypoint index swapping
         rotation=15,
         scale=0.10,
         color_jitter=0.15,
         bbox_safe=True,
+        content_cfg: dict | None = None,
     ):
         self.input_size = input_size
-        self.flip_pairs = flip_pairs or []
+        # flip_pairs support removed
+        content_cfg = content_cfg or {}
+
+        # Read content augmentation params (with sensible defaults)
+        brightness_contrast_p = float(content_cfg.get("brightness_contrast_p", 0.5))
+        sunflare_p = float(content_cfg.get("sunflare_p", 0.15))
+        motion_blur_p = float(content_cfg.get("motion_blur_p", 0.15))
+        gauss_noise_p = float(content_cfg.get("gauss_noise_p", 0.2))
+        gauss_noise_var = tuple(content_cfg.get("gauss_noise_var", [10.0, 50.0]))
+        compression_p = float(content_cfg.get("compression_p", 0.2))
+        compression_quality = tuple(content_cfg.get("compression_quality", [60, 100]))
 
         # Compose two pipelines:
         # - full_transform: includes geometric transforms and is used when no bbox
@@ -38,10 +49,10 @@ class AlbumentationsKeypointPipeline:
 
         # Build content-only transforms
         content_transforms = [
-            A.RandomBrightnessContrast(brightness_limit=color_jitter, contrast_limit=color_jitter, p=0.5),
-            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_lower=0.3, p=0.15),
-            A.MotionBlur(blur_limit=7, p=0.15),
-            A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+            A.RandomBrightnessContrast(brightness_limit=color_jitter, contrast_limit=color_jitter, p=brightness_contrast_p),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), angle_lower=0.3, p=sunflare_p),
+            A.MotionBlur(blur_limit=7, p=motion_blur_p),
+            A.GaussNoise(var_limit=gauss_noise_var, p=gauss_noise_p),
         ]
 
         # Image compression transform: prefer JpegCompression, fallback to ImageCompression
@@ -52,6 +63,27 @@ class AlbumentationsKeypointPipeline:
             comp = A.ImageCompression(quality_lower=60, quality_upper=100, p=0.2)
 
         if comp is not None:
+            # set comp probability and quality from config
+            if hasattr(comp, 'quality_lower'):
+                # albumentations classes accept quality_lower/upper in ctor
+                # comp already created with defaults; recreate with config
+                try:
+                    if hasattr(A, 'JpegCompression') and isinstance(comp, A.JpegCompression.__class__):
+                        comp = A.JpegCompression(quality_lower=compression_quality[0], quality_upper=compression_quality[1], p=compression_p)
+                    else:
+                        comp = A.ImageCompression(quality_lower=compression_quality[0], quality_upper=compression_quality[1], p=compression_p)
+                except Exception:
+                    # fall back: set p on existing transform if possible
+                    try:
+                        comp.p = compression_p
+                    except Exception:
+                        pass
+            else:
+                try:
+                    comp.p = compression_p
+                except Exception:
+                    pass
+
             # place compression among content transforms
             content_transforms.insert(1, comp)
 
@@ -66,7 +98,6 @@ class AlbumentationsKeypointPipeline:
 
         # full pipeline: geometry + content + resize
         geom_transforms = [
-            A.HorizontalFlip(p=0.5),
             A.OneOf([
                 A.Affine(scale=(1 - scale, 1 + scale), rotate=(-rotation, rotation), interpolation=cv2.INTER_LINEAR, mode=cv2.BORDER_CONSTANT),
                 A.ShiftScaleRotate(shift_limit=0.05, scale_limit=scale, rotate_limit=rotation, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_CONSTANT),
@@ -137,12 +168,26 @@ class AlbumentationsKeypointPipeline:
             # apply content transforms + resize, normalized coords remain valid.
             new_bbox = np.array([x1 / W_img, y1 / H_img, x2 / W_img, y2 / H_img], dtype=np.float32)
 
-        # Choose content-only pipeline when bbox is present to avoid geometry
+        # Determine whether bbox is valid to pass to albumentations.
+        # Very small or degenerate boxes can cause albumentations to raise errors
+        # (x_max <= x_min). In that case, fall back to content-only pipeline.
+        pass_bbox_to_transform = False
         if bbox is not None:
-            augmented = self.content_transform(image=img, keypoints=kpts_xy)
-        else:
-            # No bbox: safe to run geometric transforms which also update keypoints
+            bw = x2 - x1
+            bh = y2 - y1
+            # require at least a couple pixels of size to consider geometric transform
+            if bw >= 2.0 and bh >= 2.0:
+                pass_bbox_to_transform = True
+
+        if pass_bbox_to_transform:
+            bboxes = [(x1, y1, x2, y2)]
+            # Use full pipeline (geometry + content). Albumentations will transform
+            # image, keypoints and bbox consistently and return updated bboxes.
             augmented = self.full_transform(image=img, keypoints=kpts_xy, bboxes=bboxes)
+        else:
+            # Degenerate or missing bbox: avoid geometry transforms that could
+            # produce invalid bboxes; use content-only pipeline instead.
+            augmented = self.content_transform(image=img, keypoints=kpts_xy)
         new_img = augmented["image"]
         new_kpts = np.array(augmented.get("keypoints", []), dtype=np.float32)
 
@@ -174,30 +219,27 @@ class AlbumentationsKeypointPipeline:
             # normalize to [0,1]
             new_bbox = np.array([bx[0] / iw, bx[1] / ih, bx[2] / iw, bx[3] / ih], dtype=np.float32)
 
-        # If a horizontal flip was applied, swap keypoint indices according to flip_pairs
-        replay = augmented.get("replay", None)
-        flipped = False
-        if replay is not None:
-            for t in replay.get("transforms", []):
-                if t.get("name", "") == "HorizontalFlip" and t.get("applied", False):
-                    flipped = True
-                    break
+        # Previously we swapped keypoint indices on horizontal flip using
+        # configured `flip_pairs`. That logic has been removed: the dataset's
+        # annotations must already be in a consistent order and models should
+        # handle flips via symmetric training or by explicit label mapping
+        # upstream if necessary.
 
-        if flipped and new_kpts.size != 0 and len(self.flip_pairs) > 0:
-            # swap x,y pairs
-            for a, b in self.flip_pairs:
-                if a < new_kpts.shape[0] and b < new_kpts.shape[0]:
-                    tmp = new_kpts[a].copy()
-                    new_kpts[a] = new_kpts[b]
-                    new_kpts[b] = tmp
+        # Update visibility: mark keypoints outside the output image as invisible.
+        # new_kpts contains (x,y) in pixel coords of the transformed/resized image.
+        if new_kpts.size != 0:
+            ih, iw = self.input_size[1], self.input_size[0]
+            xs = new_kpts[:, 0]
+            ys = new_kpts[:, 1]
+            in_bounds = (xs >= 0) & (xs <= (iw - 1)) & (ys >= 0) & (ys <= (ih - 1))
 
-        # Restore visibility channel if provided
-        if vis is not None and new_kpts.size != 0:
-            new_kpts = np.concatenate([new_kpts, vis], axis=1)
-        elif new_kpts.size != 0:
-            # If no visibility information, append ones
-            ones = np.ones((new_kpts.shape[0], 1), dtype=np.float32)
-            new_kpts = np.concatenate([new_kpts, ones], axis=1)
+            if vis is not None:
+                orig_vis = (vis[:, 0] > 0).astype(np.bool_)
+                merged_vis = (orig_vis & in_bounds).astype(np.float32)[:, None]
+            else:
+                merged_vis = in_bounds.astype(np.float32)[:, None]
+
+            new_kpts = np.concatenate([new_kpts, merged_vis], axis=1)
 
         # Normalize image: to [0,1], then standardize by mean/std
         new_img = new_img.astype(np.float32) / 255.0

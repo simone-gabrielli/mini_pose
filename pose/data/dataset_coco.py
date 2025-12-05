@@ -39,11 +39,7 @@ class CocoKeypointsDataset(Dataset):
         self.annotations = coco["annotations"]
         self.num_keypoints = len(coco["categories"][0]["keypoints"])
 
-        flip_pairs = [
-            (36,45),(37,44),(38,43),(39,42),(40,47),(41,46),
-            (31,35),(32,34),
-            (48,54),(49,53),(50,52),(51,51),
-        ]
+        # flip_pairs removed — no automatic keypoint index swapping on flip
 
         aug_cfg = aug_cfg or {}
         # Optional: enable bbox-based cropping (FAN-style) during training.
@@ -54,10 +50,10 @@ class CocoKeypointsDataset(Dataset):
         self.face_margin = float(aug_cfg.get("face_margin", 0.25))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
-            flip_pairs=flip_pairs,
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),
-            color_jitter=aug_cfg.get("color_jitter", 0.15)
+            color_jitter=aug_cfg.get("color_jitter", 0.15),
+            content_cfg=aug_cfg.get("content", None),
         )
 
         # Augmentation factor: replicate annotation entries to increase dataset size
@@ -106,6 +102,10 @@ class CocoKeypointsDataset(Dataset):
             img_bgr = img_bgr[y1:y2, x1:x2]
             kpts[:, 0] -= x1
             kpts[:, 1] -= y1
+            # Update bbox to coordinates relative to the cropped image (COCO x,y,w,h)
+            # original bbox (x,y,w,h) is in the original image; after cropping,
+            # the bbox origin moves by (x1,y1).
+            bbox = [x - x1, y - y1, w, h]
 
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 

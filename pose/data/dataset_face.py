@@ -74,10 +74,10 @@ class CocoFaceDataset(Dataset):
         # we don't have keypoints, so pass None for keypoints when calling.
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
-            flip_pairs=[],
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),
             color_jitter=aug_cfg.get("color_jitter", 0.15),
+            content_cfg=aug_cfg.get("content", None),
         )
 
         # Augmentation factor: replicate items to enlarge training set
