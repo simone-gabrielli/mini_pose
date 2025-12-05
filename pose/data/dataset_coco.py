@@ -60,6 +60,15 @@ class CocoKeypointsDataset(Dataset):
             color_jitter=aug_cfg.get("color_jitter", 0.15)
         )
 
+        # Augmentation factor: replicate annotation entries to increase dataset size
+        aug_factor = int(aug_cfg.get("aug_factor", 1))
+        if aug_factor > 1:
+            orig = list(self.annotations)
+            self.annotations = []
+            for i in range(aug_factor):
+                # shallow copy each dict to avoid accidental shared-state edits
+                self.annotations.extend([dict(a) for a in orig])
+
     def __len__(self):
         return len(self.annotations)
 
@@ -100,7 +109,7 @@ class CocoKeypointsDataset(Dataset):
 
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        img_t, kpts_t = self.transform(img, kpts, bbox)
+        img_t, kpts_t, _ = self.transform(img, kpts, bbox)
 
         heatmaps = generate_heatmaps(
             kpts_t.numpy(),

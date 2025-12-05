@@ -198,45 +198,59 @@ class Trainer:
         for batch in pbar:
             imgs = batch["image"].to(self.device)
 
-            # Use volumetric 3D heatmaps when training with 3D loss
-            if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
-                targets = batch["heatmaps_3d"].to(self.device)
+            loss_name = self.cfg.get("loss", {}).get("name", "")
+
+            # Branch: direct pose regression with reprojection loss
+            if loss_name == "pose_reprojection":
+                out = self.model(imgs)
+                if isinstance(out, dict):
+                    preds_2d = out.get("proj")
+                else:
+                    preds_2d = out
+
+                if preds_2d is None:
+                    raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
+
+                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
+                weights = batch.get("pose_weights")
+                if weights is not None:
+                    weights = weights.to(self.device)
+
+                loss = self.criterion(preds_2d, targets_2d, weights)
+
             else:
-                targets = batch["heatmaps"].to(self.device)
+                # Heatmap-based training (existing behaviour)
+                if loss_name == "heatmap_3d_mse":
+                    targets = batch["heatmaps_3d"].to(self.device)
+                else:
+                    targets = batch["heatmaps"].to(self.device)
 
-            visible = batch["visible"].to(self.device)
-            depth_targets = batch.get("depth", None)
-            if depth_targets is not None:
-                depth_targets = depth_targets.to(self.device)
+                visible = batch["visible"].to(self.device)
+                depth_targets = batch.get("depth", None)
+                if depth_targets is not None:
+                    depth_targets = depth_targets.to(self.device)
 
-            out = self.model(imgs)
-            # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
-            if isinstance(out, tuple) and len(out) == 4:
-                preds_last, preds_all, depth_last, depth_all = out
-                loss = 0.0
-                for i in range(len(preds_all)):
-                    p = preds_all[i]
-                    loss += self.criterion(p, targets, visible)
-                    if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                        d = depth_all[i]
-                        loss += self.depth_criterion(d, depth_targets)
-            else:
-                preds_last, preds_all = out
-                loss = 0.0
-                for p in preds_all:
-                    loss += self.criterion(p, targets, visible)
+                out = self.model(imgs)
+                # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
+                if isinstance(out, tuple) and len(out) == 4:
+                    preds_last, preds_all, depth_last, depth_all = out
+                    loss = 0.0
+                    for i in range(len(preds_all)):
+                        p = preds_all[i]
+                        loss += self.criterion(p, targets, visible)
+                        if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                            d = depth_all[i]
+                            loss += self.depth_criterion(d, depth_targets)
+                else:
+                    preds_last, preds_all = out
+                    loss = 0.0
+                    for p in preds_all:
+                        loss += self.criterion(p, targets, visible)
 
-                if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
-                    hm_targets = batch["heatmaps"].to(self.device)
-                    aux_loss = self._mse2d(preds_last, hm_targets)
-                    loss = loss + self.aux_2d_weight * aux_loss
-
-                # If we're using volumetric 3D loss, add an auxiliary 2D MSE
-                if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
-                    # preds_last is a 2D probabilistic heatmap (B,K,H,W)
-                    hm_targets = batch["heatmaps"].to(self.device)
-                    aux_loss = self._mse2d(preds_last, hm_targets)
-                    loss = loss + self.aux_2d_weight * aux_loss
+                    if loss_name == "heatmap_3d_mse":
+                        hm_targets = batch["heatmaps"].to(self.device)
+                        aux_loss = self._mse2d(preds_last, hm_targets)
+                        loss = loss + self.aux_2d_weight * aux_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -254,40 +268,63 @@ class Trainer:
         self.model.eval()
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [val]")
         running_loss = 0.0
+        loss_name = self.cfg.get("loss", {}).get("name", "")
+
+        # For heatmap-based models we also track PCK/NME; for pose
+        # regression we only report the scalar loss.
+        coord_preds = []
+        coord_targets = []
+
         for batch in pbar:
             imgs = batch["image"].to(self.device)
 
-            if self.cfg.get("loss", {}).get("name", "") == "heatmap_3d_mse":
-                targets = batch["heatmaps_3d"].to(self.device)
+            if loss_name == "pose_reprojection":
+                out = self.model(imgs)
+                if isinstance(out, dict):
+                    preds_2d = out.get("proj")
+                else:
+                    preds_2d = out
+
+                if preds_2d is None:
+                    raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
+
+                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
+                weights = batch.get("pose_weights")
+                if weights is not None:
+                    weights = weights.to(self.device)
+
+                loss = self.criterion(preds_2d, targets_2d, weights)
+                preds_last = None  # no heatmaps here
+
             else:
-                targets = batch["heatmaps"].to(self.device)
+                if loss_name == "heatmap_3d_mse":
+                    targets = batch["heatmaps_3d"].to(self.device)
+                else:
+                    targets = batch["heatmaps"].to(self.device)
 
-            visible = batch["visible"].to(self.device)
-            depth_targets = batch.get("depth", None)
-            if depth_targets is not None:
-                depth_targets = depth_targets.to(self.device)
+                visible = batch["visible"].to(self.device)
+                depth_targets = batch.get("depth", None)
+                if depth_targets is not None:
+                    depth_targets = depth_targets.to(self.device)
 
-            out = self.model(imgs)
-            if isinstance(out, tuple) and len(out) == 4:
-                preds_last, preds_all, depth_last, depth_all = out
-                loss = 0.0
-                for i in range(len(preds_all)):
-                    p = preds_all[i]
-                    loss += self.criterion(p, targets, visible)
-                    if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                        d = depth_all[i]
-                        loss += self.depth_criterion(d, depth_targets)
-            else:
-                preds_last, preds_all = out
-                loss = 0.0
-                for p in preds_all:
-                    loss += self.criterion(p, targets, visible)
+                out = self.model(imgs)
+                if isinstance(out, tuple) and len(out) == 4:
+                    preds_last, preds_all, depth_last, depth_all = out
+                    loss = 0.0
+                    for i in range(len(preds_all)):
+                        p = preds_all[i]
+                        loss += self.criterion(p, targets, visible)
+                        if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                            d = depth_all[i]
+                            loss += self.depth_criterion(d, depth_targets)
+                else:
+                    preds_last, preds_all = out
+                    loss = 0.0
+                    for p in preds_all:
+                        loss += self.criterion(p, targets, visible)
 
-            # Optionally compute metrics (e.g., PCK, NME) if model outputs heatmaps
-            if preds_last.dim() == 4:  # (B, K, H, W)
-                coord_preds = []
-                coord_targets = []
-
+            # Only compute PCK/NME if we actually have heatmaps
+            if preds_last is not None and preds_last.dim() == 4:
                 # image and heatmap sizes from dataset config
                 H_img, W_img = self.train_ds.input_size[1], self.train_ds.input_size[0]
                 H_hm, W_hm = self.train_ds.heatmap_size[1], self.train_ds.heatmap_size[0]
@@ -316,15 +353,19 @@ class Trainer:
         self.log_metric("val", "loss", val_loss)
 
         # If we computed keypoint coords, also log PCK/NME
-        try:
-            coord_preds_arr = np.stack(coord_preds)
-            coord_targets_arr = np.stack(coord_targets)
-            pck = compute_pck(coord_preds_arr, coord_targets_arr)
-            nme = compute_nme(coord_preds_arr, coord_targets_arr)
-            self.log_metric("val", "pck", float(pck))
-            self.log_metric("val", "nme", float(nme))
-            print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
-        except Exception:
+        if coord_preds:
+            try:
+                coord_preds_arr = np.stack(coord_preds)
+                coord_targets_arr = np.stack(coord_targets)
+                pck = compute_pck(coord_preds_arr, coord_targets_arr)
+                nme = compute_nme(coord_preds_arr, coord_targets_arr)
+                self.log_metric("val", "pck", float(pck))
+                self.log_metric("val", "nme", float(nme))
+                print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
+            except Exception:
+                print(f"Val: loss={val_loss:.4f}")
+        else:
+            # pose-reprojection case (no heatmaps)
             print(f"Val: loss={val_loss:.4f}")
 
         return val_loss

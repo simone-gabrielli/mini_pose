@@ -3,8 +3,8 @@ seed: 42
 
 data:
   type: coco_keypoints
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
   input_size: [256, 256]      # should match Albumentations + head stride
   heatmap_size: [64, 64]
@@ -16,6 +16,7 @@ data:
     rotation: 30
     scale: 0.1
     color_jitter: 0.10
+    aug_factor: 3
 
 model:
   name: mobilenet_pose

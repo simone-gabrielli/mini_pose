@@ -70,11 +70,23 @@ class CocoFaceDataset(Dataset):
                 self.items.append({"path": path, "bbox": None, "width": info.get("width"), "height": info.get("height")})
 
         aug_cfg = aug_cfg or {}
-        self.transform = A.Compose([
-            A.Resize(self.input_size[1], self.input_size[0]),
-            A.Normalize(),
-            ToTensorV2(),
-        ])
+        # Use stronger augmentation pipeline (bbox-aware). For face-only dataset
+        # we don't have keypoints, so pass None for keypoints when calling.
+        self.transform = AlbumentationsKeypointPipeline(
+            input_size=input_size,
+            flip_pairs=[],
+            rotation=aug_cfg.get("rotation", 15),
+            scale=aug_cfg.get("scale", 0.10),
+            color_jitter=aug_cfg.get("color_jitter", 0.15),
+        )
+
+        # Augmentation factor: replicate items to enlarge training set
+        aug_factor = int(aug_cfg.get("aug_factor", 1))
+        if aug_factor > 1:
+            orig = list(self.items)
+            self.items = []
+            for i in range(aug_factor):
+                self.items.extend([dict(it) for it in orig])
 
         # expose same attributes Trainer expects (input_size, heatmap_size)
         self.num_keypoints = 0
@@ -99,9 +111,19 @@ class CocoFaceDataset(Dataset):
             y2 = bbox[3] / H
             conf = 1.0
 
-        aug = self.transform(image=img)
-        img_t = aug["image"].float()
-
-        target = torch.tensor([conf, x1, y1, x2, y2], dtype=torch.float32)
+        # Pass bbox through augmentation pipeline so flares/occlusions/flip affect it
+        if bbox is None:
+            img_t, _, bbox_t = self.transform(img, keypoints=None, bbox=None)
+            # negative sample: keep zero bbox
+            target = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+        else:
+            img_t, _, bbox_t = self.transform(img, keypoints=None, bbox=[bbox[0], bbox[1], bbox[2], bbox[3]])
+            if bbox_t is None:
+                # fallback to normalized coords from original size
+                target = torch.tensor([conf, x1, y1, x2, y2], dtype=torch.float32)
+            else:
+                # bbox_t is normalized relative to input_size
+                bx = bbox_t.numpy()
+                target = torch.tensor([conf, bx[0], bx[1], bx[2], bx[3]], dtype=torch.float32)
 
         return {"image": img_t, "bbox": target, "meta": {"image_path": it["path"], "orig_size": (W, H)}}

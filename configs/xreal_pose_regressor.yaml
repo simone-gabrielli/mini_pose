@@ -1,0 +1,50 @@
+experiment: xreal_pose_regressor
+seed: 42
+
+# NOTE: this config assumes you have:
+#   1) A CAD model points file at `cad_model_path` (np.load-able, shape (N,3)).
+#   2) COCO-style annotations where each image has a set of 2D keypoints that
+#      correspond 1:1 to those CAD points. The dataset class below will expect
+#      those as `pose_keypoints_2d` and `pose_weights` tensors.
+
+data:
+  # Reuse coco_keypoints dataset type for now; you can swap to a
+  # dedicated pose dataset if you create one and register it.
+  type: coco_keypoints
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 32
+  num_workers: 0
+  aug:
+    use_bbox_crop: false
+    face_margin: 0.25
+    rotation: 0
+    scale: 0.
+    color_jitter: 0.10
+
+model:
+  name: glasses_pose_regressor
+  # num_keypoints is injected by Trainer, but unused by this model.
+  fx: 701.66
+  fy: 700.69
+  cx: 632.93
+  cy: 345.93
+  cad_model_path: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/xreal_one_68_v3.xml"
+  pretrained: true
+
+loss:
+  name: pose_reprojection
+  robust: charbonnier
+  epsilon: 1.0e-3
+
+train:
+  epochs: 300
+  lr: 0.001
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [100, 200]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/xreal_pose_regressor"
