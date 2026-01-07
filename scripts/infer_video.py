@@ -13,6 +13,7 @@ import argparse
 import os
 import time
 import signal
+from time import perf_counter
 from typing import Tuple
 
 import cv2
@@ -28,7 +29,15 @@ def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int,
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
 
 
-def build_detector(choice: str, device):
+def build_detector(
+    choice: str,
+    device,
+    *,
+    yunet_model: str | None = None,
+    yunet_score_thresh: float = 0.8,
+    yunet_nms_thresh: float = 0.3,
+    yunet_top_k: int = 5000,
+):
     # MTCNN
     def make_mtcnn(device_str="cpu"):
         try:
@@ -112,10 +121,69 @@ def build_detector(choice: str, device):
         def detect(self, img_bgr):
             return self.det.detect(img_bgr)
 
+    # OpenCV YuNet (FaceDetectorYN)
+    def make_yunet(model_path: str, score_thresh: float = 0.8, nms_thresh: float = 0.3, top_k: int = 5000):
+        if not model_path or not os.path.exists(model_path):
+            return None
+
+        creator = None
+        # OpenCV exposes either FaceDetectorYN.create or FaceDetectorYN_create depending on version/build.
+        if hasattr(cv2, "FaceDetectorYN") and hasattr(cv2.FaceDetectorYN, "create"):
+            creator = cv2.FaceDetectorYN.create
+        elif hasattr(cv2, "FaceDetectorYN_create"):
+            creator = cv2.FaceDetectorYN_create
+
+        if creator is None:
+            return None
+
+        try:
+            # config is unused for YuNet ONNX
+            det = creator(model_path, "", (320, 320), float(score_thresh), float(nms_thresh), int(top_k))
+
+            class YuNetDetector:
+                def __init__(self, det):
+                    self.det = det
+
+                def detect(self, img_bgr):
+                    h, w = img_bgr.shape[:2]
+                    # must match current image size
+                    try:
+                        self.det.setInputSize((int(w), int(h)))
+                    except Exception:
+                        # some builds require recreate; if setInputSize missing, fallback to no-op
+                        pass
+
+                    ok, faces = self.det.detect(img_bgr)
+                    if faces is None or len(faces) == 0:
+                        return []
+                    out = []
+                    for f in faces:
+                        # YuNet output: [x, y, w, h, score, ...]
+                        x, y, bw, bh = f[:4]
+                        out.append((int(x), int(y), int(bw), int(bh)))
+                    return out
+
+            return YuNetDetector(det)
+        except Exception:
+            return None
+
     if choice == "mtcnn":
         det = make_mtcnn(device_str=("cuda" if device.type == "cuda" else "cpu"))
         if det is None:
             raise RuntimeError("MTCNN requested but not available (install facenet-pytorch)")
+        return det
+    if choice == "yunet":
+        det = make_yunet(
+            yunet_model or "",
+            score_thresh=yunet_score_thresh,
+            nms_thresh=yunet_nms_thresh,
+            top_k=yunet_top_k,
+        )
+        if det is None:
+            raise RuntimeError(
+                "YuNet requested but not available. Ensure: (1) opencv-contrib-python installed, "
+                "(2) your OpenCV build exposes FaceDetectorYN, (3) --yunet-model points to a valid .onnx file."
+            )
         return det
     if choice == "dlib":
         det = make_dlib()
@@ -149,17 +217,62 @@ def main():
     parser.add_argument("--num-keypoints", type=int, default=68)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--input-size", type=int, default=256)
-    parser.add_argument("--detector", choices=["auto", "mtcnn", "dlib", "composite", "haar"], default="auto")
+    parser.add_argument("--detector", choices=["auto", "mtcnn", "yunet", "dlib", "composite", "haar"], default="auto")
+    parser.add_argument("--yunet-model", default=None, help="Path to YuNet ONNX model (required if --detector yunet)")
+    parser.add_argument("--yunet-score", type=float, default=0.8, help="YuNet score threshold")
+    parser.add_argument("--yunet-nms", type=float, default=0.3, help="YuNet NMS threshold")
+    parser.add_argument("--yunet-topk", type=int, default=5000, help="YuNet top_k")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--max-faces", type=int, default=4)
     parser.add_argument("--skip-frames", type=int, default=1)
     parser.add_argument("--draw-face-box", action="store_true")
+    parser.add_argument("--box-pad", type=int, default=50, help="Pixel padding added around detected face box")
+    parser.add_argument("--display", action="store_true", help="Show real-time preview window")
+    parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=1,
+        help="Run face detector every N processed frames; reuse last boxes in-between",
+    )
+    parser.add_argument(
+        "--detector-scale",
+        type=float,
+        default=1.0,
+        help="Downscale factor for face detection only (e.g. 0.5). Boxes are scaled back.",
+    )
+    parser.add_argument(
+        "--infer-every",
+        type=int,
+        default=1,
+        help="Run keypoint model every N processed frames; reuse last keypoints in-between",
+    )
+    parser.add_argument("--profile", action="store_true", help="Log per-stage timing breakdown")
+    parser.add_argument("--profile-every", type=int, default=60, help="Print timing every N processed frames")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    print(f"Device requested: {args.device} | torch.cuda.is_available={torch.cuda.is_available()} | using: {device}")
+    if device.type == "cuda":
+        try:
+            print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+
+    if device.type == "cuda":
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
     model = load_model(args.checkpoint, model_name=args.model_name, num_keypoints=args.num_keypoints, device=device)
     model.eval()
+    try:
+        p0 = next(model.parameters())
+        print(f"Model parameter device: {p0.device}")
+    except Exception:
+        pass
 
     input_path = args.input_video
     if not os.path.exists(input_path):
@@ -181,12 +294,48 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
 
-    detector = build_detector(args.detector if args.detector != "auto" else "auto", device)
+    detector = build_detector(
+        args.detector if args.detector != "auto" else "auto",
+        device,
+        yunet_model=args.yunet_model,
+        yunet_score_thresh=args.yunet_score,
+        yunet_nms_thresh=args.yunet_nms,
+        yunet_top_k=args.yunet_topk,
+    )
     tfm = BasicTransform(input_size=(args.input_size, args.input_size))
 
     frame_idx = 0
     t_start = time.time()
     processed = 0
+
+    # reused buffers
+    kpts_dummy = np.zeros((args.num_keypoints, 3), dtype=np.float32)
+
+    # detector caching
+    last_boxes = []
+    last_detect_frame = -10**9
+
+    # keypoint caching
+    last_kpts = []  # list[np.ndarray] in full-frame coords
+    last_kpts_frame = -10**9
+
+    # profiling accumulators (seconds)
+    prof = {
+        "read": 0.0,
+        "detect": 0.0,
+        "preprocess": 0.0,
+        "to_device": 0.0,
+        "forward": 0.0,
+        "to_cpu": 0.0,
+        "decode_draw": 0.0,
+        "write": 0.0,
+        "display": 0.0,
+        "total": 0.0,
+    }
+    prof_n = 0
+
+    window_name = "mini_pose"
+    paused = False
 
     stop_requested = {"stop": False}
 
@@ -201,7 +350,13 @@ def main():
 
     try:
         while True:
+            t_total0 = perf_counter() if args.profile else None
+
+            t0 = perf_counter() if args.profile else None
             ret, frame_bgr = cap.read()
+            if args.profile:
+                prof["read"] += perf_counter() - t0
+
             if not ret:
                 break
 
@@ -209,12 +364,65 @@ def main():
                 break
 
             if (frame_idx % args.skip_frames) != 0:
+                t0 = perf_counter() if args.profile else None
                 writer.write(frame_bgr)
+                if args.profile:
+                    prof["write"] += perf_counter() - t0
+
+                if args.display:
+                    t0 = perf_counter() if args.profile else None
+                    disp = frame_bgr
+                    if args.display_scale and args.display_scale != 1.0:
+                        disp = cv2.resize(
+                            disp,
+                            (int(W * args.display_scale), int(H * args.display_scale)),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    cv2.imshow(window_name, disp)
+                    key = cv2.waitKey(1 if not paused else 30) & 0xFF
+                    if key in (ord("q"), 27):
+                        stop_requested["stop"] = True
+                    elif key == ord("p"):
+                        paused = not paused
+                    if args.profile:
+                        prof["display"] += perf_counter() - t0
+
                 frame_idx += 1
                 continue
 
-            boxes = detector.detect(frame_bgr)
-            if boxes:
+            # Face detection (optionally cached)
+            t0 = perf_counter() if args.profile else None
+            do_detect = (processed - last_detect_frame) >= max(1, args.detect_every)
+            boxes = last_boxes
+            if do_detect:
+                det_frame = frame_bgr
+                scale = float(args.detector_scale)
+                if scale != 1.0 and scale > 0:
+                    det_frame = cv2.resize(
+                        frame_bgr,
+                        (max(1, int(W * scale)), max(1, int(H * scale))),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                boxes = detector.detect(det_frame)
+                if scale != 1.0 and scale > 0 and boxes:
+                    inv = 1.0 / scale
+                    scaled = []
+                    for (x, y, w, h) in boxes:
+                        scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv)))
+                    boxes = scaled
+                last_boxes = boxes
+                last_detect_frame = processed
+            if args.profile:
+                prof["detect"] += perf_counter() - t0
+
+            # Keypoint inference (optionally cached)
+            do_infer = (processed - last_kpts_frame) >= max(1, args.infer_every)
+            if do_detect:
+                # if boxes just changed, ensure we refresh keypoints
+                do_infer = True
+
+            if boxes and do_infer:
+                t0 = perf_counter() if args.profile else None
                 faces = []
                 boxes_clamped = []
                 for box in boxes[: args.max_faces]:
@@ -223,10 +431,11 @@ def main():
                     cx = x + w / 2.0
                     cy = y + h / 2.0
                     size = max(w, h) * (1.0 + margin)
-                    x1 = int(cx - size / 2.0)
-                    y1 = int(cy - size / 2.0)
-                    x2 = int(cx + size / 2.0)
-                    y2 = int(cy + size / 2.0)
+                    pad = int(max(0, args.box_pad))
+                    x1 = int(cx - size / 2.0) - pad
+                    y1 = int(cy - size / 2.0) - pad
+                    x2 = int(cx + size / 2.0) + pad
+                    y2 = int(cy + size / 2.0) + pad
 
                     x1 = max(0, x1)
                     y1 = max(0, y1)
@@ -238,14 +447,23 @@ def main():
                         continue
 
                     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-                    kpts_dummy = np.zeros((args.num_keypoints, 3), dtype=np.float32)
                     img_t, _ = tfm(face_rgb, keypoints=kpts_dummy)
                     faces.append(img_t)
                     boxes_clamped.append((x1, y1, x2, y2))
 
+                if args.profile:
+                    prof["preprocess"] += perf_counter() - t0
+
                 if faces:
+                    t0 = perf_counter() if args.profile else None
                     batch = torch.stack(faces, dim=0).to(device)
-                    with torch.no_grad():
+                    if args.profile:
+                        prof["to_device"] += perf_counter() - t0
+
+                    with torch.inference_mode():
+                        t0 = perf_counter() if args.profile else None
+                        if args.profile and device.type == "cuda":
+                            torch.cuda.synchronize()
                         if args.fp16 and device.type == "cuda":
                             from torch.cuda.amp import autocast
 
@@ -253,6 +471,10 @@ def main():
                                 preds = model(batch)
                         else:
                             preds = model(batch)
+                        if args.profile and device.type == "cuda":
+                            torch.cuda.synchronize()
+                        if args.profile:
+                            prof["forward"] += perf_counter() - t0
 
                     if isinstance(preds, (tuple, list)):
                         preds_last = preds[0]
@@ -261,7 +483,13 @@ def main():
                     else:
                         preds_last = preds
 
+                    t0 = perf_counter() if args.profile else None
                     preds_last = preds_last.cpu()
+                    if args.profile:
+                        prof["to_cpu"] += perf_counter() - t0
+
+                    t0 = perf_counter() if args.profile else None
+                    kpts_out = []
                     for i in range(preds_last.shape[0]):
                         heatmaps = preds_last[i]
                         coords = decode_heatmaps(heatmaps)
@@ -278,13 +506,73 @@ def main():
                         coords[:, 0] = coords[:, 0] * scale_x + x1
                         coords[:, 1] = coords[:, 1] * scale_y + y1
 
-                        draw_landmarks(frame_bgr, coords, color=(0, 0, 255))
-                        if args.draw_face_box:
-                            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                        kpts_out.append(coords)
 
+                    last_kpts = kpts_out
+                    last_kpts_frame = processed
+
+                    if args.profile:
+                        prof["decode_draw"] += perf_counter() - t0
+
+            # Draw cached keypoints + current boxes
+            if boxes:
+                t0 = perf_counter() if args.profile else None
+                for i, box in enumerate(boxes[: args.max_faces]):
+                    x, y, w, h = box
+                    if args.draw_face_box:
+                        pad = int(max(0, args.box_pad))
+                        x1 = max(0, int(x) - pad)
+                        y1 = max(0, int(y) - pad)
+                        x2 = min(W - 1, int(x + w) + pad)
+                        y2 = min(H - 1, int(y + h) + pad)
+                        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                    if i < len(last_kpts):
+                        draw_landmarks(frame_bgr, last_kpts[i], color=(0, 0, 255))
+                if args.profile:
+                    prof["decode_draw"] += perf_counter() - t0
+
+            t0 = perf_counter() if args.profile else None
             writer.write(frame_bgr)
+            if args.profile:
+                prof["write"] += perf_counter() - t0
+
+            if args.display:
+                t0 = perf_counter() if args.profile else None
+                disp = frame_bgr
+                if args.display_scale and args.display_scale != 1.0:
+                    disp = cv2.resize(
+                        disp,
+                        (int(W * args.display_scale), int(H * args.display_scale)),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                cv2.imshow(window_name, disp)
+                key = cv2.waitKey(1 if not paused else 30) & 0xFF
+                if key in (ord("q"), 27):
+                    stop_requested["stop"] = True
+                elif key == ord("p"):
+                    paused = not paused
+                if args.profile:
+                    prof["display"] += perf_counter() - t0
+
             frame_idx += 1
             processed += 1
+
+            if args.profile:
+                prof["total"] += perf_counter() - t_total0
+                prof_n += 1
+                if args.profile_every > 0 and (processed % args.profile_every) == 0 and prof_n > 0:
+                    avg = {k: (v / prof_n) * 1000.0 for k, v in prof.items()}
+                    fps_est = 1000.0 / max(1e-6, avg["total"])
+                    det_mode = f"every={args.detect_every}, scale={args.detector_scale}" \
+                        if args.detect_every != 1 or args.detector_scale != 1.0 else "default"
+                    print(
+                        "Timing (ms/frame): "
+                        f"total={avg['total']:.1f}, read={avg['read']:.1f}, detect={avg['detect']:.1f}, "
+                        f"prep={avg['preprocess']:.1f}, to_dev={avg['to_device']:.1f}, "
+                        f"fwd={avg['forward']:.1f}, to_cpu={avg['to_cpu']:.1f}, decode/draw={avg['decode_draw']:.1f}, "
+                        f"write={avg['write']:.1f}, display={avg['display']:.1f} | "
+                        f"~{fps_est:.1f} fps | det({det_mode}) | infer(every={args.infer_every})"
+                    )
 
             if processed % 100 == 0:
                 elapsed = time.time() - t_start
@@ -293,6 +581,11 @@ def main():
     finally:
         cap.release()
         writer.release()
+        if args.display:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     total_t = time.time() - t_start
     print(f"Done. Wrote annotated video to: {out_path} (processed {processed} frames in {total_t:.1f}s)")
