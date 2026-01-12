@@ -51,6 +51,28 @@ def _extract_preds_last(model_out: object) -> torch.Tensor:
     raise TypeError(f"Unsupported model output type for heatmaps: {type(model_out)}")
 
 
+def _try_extract_coords_batch(model_out: object) -> torch.Tensor | None:
+    """Try to extract a (B, K, 2) coordinate tensor from a model output.
+
+    Supports LOTR-style outputs:
+      - (landmarks_norm, landmarks_pixel) where landmarks_pixel is (B, K, 2) or (B, K, 3)
+    Returns:
+      - coords_px: (B, K, 2) float tensor in crop pixel space, or None if not applicable.
+    """
+    if not isinstance(model_out, tuple):
+        return None
+    if len(model_out) < 2:
+        return None
+    coords = model_out[1]
+    if not isinstance(coords, torch.Tensor):
+        return None
+    if coords.dim() != 3:
+        return None
+    if coords.size(-1) < 2:
+        return None
+    return coords[..., :2]
+
+
 def _load_coco_bboxes_in_annotation_order(coco_json_path: str) -> list[tuple[float, float, float, float]]:
     import json
 
@@ -315,6 +337,13 @@ def main():
             pass
 
     model = load_model(args.checkpoint, model_name=args.model_name, num_keypoints=args.num_keypoints, device=device)
+    # Ensure coordinate-regression models (e.g., LOTR) scale outputs to the same
+    # crop size we use in this script.
+    if hasattr(model, "input_size"):
+        try:
+            model.input_size = (int(args.input_size), int(args.input_size))
+        except Exception:
+            pass
     model.eval()
     try:
         p0 = next(model.parameters())
@@ -539,38 +568,66 @@ def main():
                         if args.profile:
                             prof["forward"] += perf_counter() - t0
 
-                    preds_last = _extract_preds_last(preds)
-
+                    # Decode either coordinate-regression outputs (LOTR) or heatmaps.
                     t0 = perf_counter() if args.profile else None
-                    preds_last = preds_last.cpu()
-                    if args.profile:
-                        prof["to_cpu"] += perf_counter() - t0
+                    coords_batch = _try_extract_coords_batch(preds)
 
-                    t0 = perf_counter() if args.profile else None
-                    kpts_out = []
-                    for i in range(preds_last.shape[0]):
-                        heatmaps = preds_last[i]
-                        coords = decode_heatmaps(heatmaps)
+                    if coords_batch is not None:
+                        # (B, K, 2) in resized crop pixel space
+                        coords_batch = coords_batch.detach().float().cpu().numpy()
+                        if args.profile:
+                            prof["to_cpu"] += perf_counter() - t0
 
-                        H_hm, W_hm = heatmaps.shape[1:]
-                        W_face = args.input_size
-                        H_face = args.input_size
-                        coords[:, 0] *= (W_face / W_hm)
-                        coords[:, 1] *= (H_face / H_hm)
+                        t1 = perf_counter() if args.profile else None
+                        kpts_out = []
+                        W_face = float(args.input_size)
+                        H_face = float(args.input_size)
+                        for i in range(coords_batch.shape[0]):
+                            coords = coords_batch[i]
+                            x1, y1, x2, y2 = boxes_clamped[i]
+                            scale_x = (x2 - x1) / W_face
+                            scale_y = (y2 - y1) / H_face
+                            coords[:, 0] = coords[:, 0] * scale_x + x1
+                            coords[:, 1] = coords[:, 1] * scale_y + y1
+                            kpts_out.append(coords)
 
-                        x1, y1, x2, y2 = boxes_clamped[i]
-                        scale_x = (x2 - x1) / float(W_face)
-                        scale_y = (y2 - y1) / float(H_face)
-                        coords[:, 0] = coords[:, 0] * scale_x + x1
-                        coords[:, 1] = coords[:, 1] * scale_y + y1
+                        last_kpts = kpts_out
+                        last_kpts_frame = processed
+                        if args.profile:
+                            prof["decode_draw"] += perf_counter() - t1
 
-                        kpts_out.append(coords)
+                    else:
+                        # Heatmap-based models
+                        preds_last = _extract_preds_last(preds)
+                        preds_last = preds_last.detach().cpu()
+                        if args.profile:
+                            prof["to_cpu"] += perf_counter() - t0
 
-                    last_kpts = kpts_out
-                    last_kpts_frame = processed
+                        t1 = perf_counter() if args.profile else None
+                        kpts_out = []
+                        for i in range(preds_last.shape[0]):
+                            heatmaps = preds_last[i]
+                            coords = decode_heatmaps(heatmaps)
 
-                    if args.profile:
-                        prof["decode_draw"] += perf_counter() - t0
+                            H_hm, W_hm = heatmaps.shape[1:]
+                            W_face = args.input_size
+                            H_face = args.input_size
+                            coords[:, 0] *= (W_face / W_hm)
+                            coords[:, 1] *= (H_face / H_hm)
+
+                            x1, y1, x2, y2 = boxes_clamped[i]
+                            scale_x = (x2 - x1) / float(W_face)
+                            scale_y = (y2 - y1) / float(H_face)
+                            coords[:, 0] = coords[:, 0] * scale_x + x1
+                            coords[:, 1] = coords[:, 1] * scale_y + y1
+
+                            kpts_out.append(coords)
+
+                        last_kpts = kpts_out
+                        last_kpts_frame = processed
+
+                        if args.profile:
+                            prof["decode_draw"] += perf_counter() - t1
 
             # Draw cached keypoints + current boxes
             if boxes:

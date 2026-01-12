@@ -1,0 +1,59 @@
+# Configuration for LOTR with ResNet50 backbone
+# Higher accuracy configuration for benchmark evaluation
+
+experiment: 300w_lotr_resnet
+seed: 42
+
+data:
+  type: coco_keypoints
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-3D/annotations/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-3D/annotations/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-3D/"
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 16               # Smaller batch for ResNet50
+  num_workers: 4
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.3
+    rotation: 25
+    scale: 0.12
+    color_jitter: 0.12
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.4
+      sunflare_p: 0.05
+      motion_blur_p: 0.1
+      gauss_noise_p: 0.15
+      gauss_noise_var: [5.0, 30.0]
+      compression_p: 0.15
+      compression_quality: [70, 100]
+
+model:
+  name: lotr
+  # ResNet50 backbone for higher accuracy (LOTR-R+ from paper)
+  backbone: resnet50
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  dim_feedforward: 512
+  dropout: 0.1
+  use_upsampling: true
+  upsampling_layers: 2
+  pretrained: true
+
+loss:
+  name: smooth_wing
+  w: 10.0
+  eps: 2.0
+  t: 2.0
+
+train:
+  epochs: 120
+  lr: 0.00005                  # Even lower LR for ResNet
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [70, 100]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/300w_lotr_resnet"

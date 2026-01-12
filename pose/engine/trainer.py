@@ -275,6 +275,13 @@ class Trainer:
 
             loss_name = self.cfg.get("loss", {}).get("name", "")
 
+            # Coordinate regression losses (LOTR-style direct coordinate prediction)
+            coord_regression_losses = [
+                "smooth_wing", "wing", "adaptive_wing", 
+                "landmark_l1", "landmark_mse", "landmark_smooth_l1",
+                "nme", "combined_landmark"
+            ]
+
             # Branch: direct pose regression with reprojection loss
             if loss_name == "pose_reprojection":
                 out = self.model(imgs)
@@ -292,6 +299,27 @@ class Trainer:
                     weights = weights.to(self.device)
 
                 loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
+
+            # Branch: coordinate regression losses (LOTR, etc.)
+            elif loss_name in coord_regression_losses:
+                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
+                visible = batch["visible"].to(self.device)
+
+                out = self.model(imgs)
+                
+                # LOTR returns (normalized_coords, pixel_coords)
+                if isinstance(out, tuple) and len(out) == 2:
+                    landmarks_norm, landmarks_pixel = out
+                    # Use pixel coordinates for loss computation
+                    preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                else:
+                    preds_2d = out
+                    if preds_2d.dim() == 2:
+                        # If flat output, reshape to (B, N, 2)
+                        B = imgs.size(0)
+                        preds_2d = preds_2d.view(B, -1, 2)
+
+                loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
 
             else:
                 # Heatmap-based training (existing behaviour)
@@ -351,10 +379,18 @@ class Trainer:
         running_loss = 0.0
         loss_name = self.cfg.get("loss", {}).get("name", "")
 
+        # Coordinate regression losses (LOTR-style direct coordinate prediction)
+        coord_regression_losses = [
+            "smooth_wing", "wing", "adaptive_wing", 
+            "landmark_l1", "landmark_mse", "landmark_smooth_l1",
+            "nme", "combined_landmark"
+        ]
+
         # For heatmap-based models we also track PCK/NME; for pose
         # regression we only report the scalar loss.
         coord_preds = []
         coord_targets = []
+        is_coord_regression = loss_name in coord_regression_losses
 
         for batch in pbar:
             imgs = batch["image"].to(self.device)
@@ -379,6 +415,33 @@ class Trainer:
 
                 loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
                 preds_last = None  # no heatmaps here
+
+            elif is_coord_regression:
+                # Coordinate regression validation (LOTR-style)
+                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
+                visible = batch["visible"].to(self.device)
+
+                out = self.model(imgs)
+                
+                # LOTR returns (normalized_coords, pixel_coords)
+                if isinstance(out, tuple) and len(out) == 2:
+                    landmarks_norm, landmarks_pixel = out
+                    preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                else:
+                    preds_2d = out
+                    if preds_2d.dim() == 2:
+                        B = imgs.size(0)
+                        preds_2d = preds_2d.view(B, -1, 2)
+
+                loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
+                preds_last = None  # no heatmaps
+
+                # Collect predictions and targets for NME computation
+                for b in range(preds_2d.size(0)):
+                    pred_coords = preds_2d[b].cpu().numpy()
+                    target_coords = targets_2d[b].cpu().numpy()
+                    coord_preds.append(pred_coords)
+                    coord_targets.append(target_coords)
 
             else:
                 if loss_name == "heatmap_3d_mse":

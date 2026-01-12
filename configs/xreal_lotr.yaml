@@ -1,0 +1,79 @@
+# Configuration for LOTR (Localization Transformer) facial landmark detection
+# Based on: "LOTR: Face Landmark Localization Using Localization Transformer"
+# Watchareeruetai et al., IEEE Access, 2022
+
+experiment: xreal_lotr
+seed: 42
+
+data:
+  type: coco_keypoints
+  # Mix multiple COCO-style datasets for training.
+  # Each entry contributes samples to the same training loader.
+  # loss_weight scales the contribution of that dataset to the loss.
+  train_datasets:
+    - name: hmd_xreal
+      train_json: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      loss_weight: 1.0
+
+    - name: 300w_xreal_air2
+      train_json: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      loss_weight: 0.3
+
+  # Validation is currently a single dataset.
+  # Pick whichever distribution you care about most for checkpoint selection.
+  val_json: "datasets/hmd_xreal/annotations/val.json"
+  val_image_root: "datasets/hmd_xreal/images"
+
+  input_size: [256, 256]      # Standard input size for LOTR
+  heatmap_size: [64, 64]      # Not used for coordinate regression, but kept for compatibility
+  batch_size: 8
+  num_workers: 0
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.5
+    rotation: 30
+    scale: 0.15
+    color_jitter: 0.15
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.5
+      sunflare_p: 0.1
+      motion_blur_p: 0.1
+      gauss_noise_p: 0.2
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
+
+model:
+  name: lotr
+  # Visual backbone: 'mobilenet_v2' (lightweight) or 'resnet50' (higher accuracy)
+  backbone: mobilenet_v2
+  # Transformer dimensions
+  d_model: 256               # Hidden dimension (paper uses 64 for LOTR-M, 256 for others)
+  nhead: 8                   # Number of attention heads
+  num_encoder_layers: 2      # Number of transformer encoder layers
+  num_decoder_layers: 2      # Number of transformer decoder layers
+  dim_feedforward: 512       # FFN hidden dimension (paper uses 512)
+  dropout: 0.1
+  # Upsampling: increases feature resolution before transformer
+  use_upsampling: true
+  upsampling_layers: 2       # 2 layers = 4x upsampling (8x8 -> 32x32)
+  pretrained: true
+
+loss:
+  name: smooth_wing
+  # Smooth-Wing loss parameters (from paper)
+  w: 10.0                    # Outer threshold
+  eps: 2.0                   # Steepness parameter
+  t: 2.0                     # Inner threshold for L2 region
+
+train:
+  epochs: 100
+  lr: 0.0001                 # Lower LR for transformers
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [60, 80]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/xreal_lotr"
