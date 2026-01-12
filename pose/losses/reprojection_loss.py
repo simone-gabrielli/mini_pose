@@ -37,6 +37,7 @@ class ReprojectionLoss(nn.Module):
         preds_2d: torch.Tensor,
         targets_2d: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute reprojection loss.
 
@@ -59,9 +60,23 @@ class ReprojectionLoss(nn.Module):
                     f"weights must have shape {per_point.shape}; got {weights.shape}"
                 )
             per_point = per_point * weights
-            denom = weights.sum().clamp(min=1e-6)
+            per_sample_denom = weights.sum(dim=1).clamp(min=1e-6)  # (B,)
         else:
-            denom = torch.tensor(per_point.numel(), dtype=per_point.dtype, device=per_point.device)
+            per_sample_denom = torch.full(
+                (per_point.size(0),),
+                float(per_point.size(1)),
+                dtype=per_point.dtype,
+                device=per_point.device,
+            )
 
-        loss = per_point.sum() / denom
-        return loss
+        per_sample_num = per_point.sum(dim=1)  # (B,)
+
+        # Preserve previous behavior when no sample_weight is provided:
+        # global sum / global denom.
+        if sample_weight is None:
+            return per_sample_num.sum() / per_sample_denom.sum().clamp(min=1e-6)
+
+        sw = sample_weight.to(device=per_point.device, dtype=per_point.dtype).view(-1)
+        num = (per_sample_num * sw).sum()
+        denom = (per_sample_denom * sw).sum().clamp(min=1e-6)
+        return num / denom

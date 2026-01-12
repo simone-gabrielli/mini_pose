@@ -36,7 +36,11 @@ datasets/
 !datasets/.gitkeep
 
 # Training/inference temp files
-debug_out.png
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
 *.tmp
 
 # Build / packaging

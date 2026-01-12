@@ -1,0 +1,59 @@
+experiment: xreal_mobilenet_hmd_plus_air2
+seed: 42
+
+data:
+  type: coco_keypoints
+
+  # Mix multiple COCO-style datasets for training.
+  # Each entry contributes samples to the same training loader.
+  # loss_weight scales the contribution of that dataset to the loss.
+  train_datasets:
+    - name: hmd_xreal
+      train_json: "datasets/hmd_xreal/annotations_v3/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      loss_weight: 1.0
+
+    - name: 300w_xreal_air2
+      train_json: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      loss_weight: 0.3
+
+  # Validation is currently a single dataset.
+  # Pick whichever distribution you care about most for checkpoint selection.
+  val_json: "datasets/hmd_xreal/annotations_v3/val.json"
+  val_image_root: "datasets/hmd_xreal/images"
+
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  batch_size: 32
+  num_workers: 0
+  aug:
+    use_bbox_crop: true
+    face_margin: 0.5
+    rotation: 30
+    scale: 0.1
+    color_jitter: 0.10
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.5
+      sunflare_p: 0.1
+      motion_blur_p: 0.1
+      gauss_noise_p: 0.2
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
+
+model:
+  name: mobilenet_pose
+
+loss:
+  name: heatmap_mse
+
+train:
+  epochs: 80
+  lr: 0.0005
+  weight_decay: 0.0001
+  optimizer: adam
+  lr_steps: [40, 50]
+  lr_gamma: 0.1
+  output_dir: "work_dirs/xreal_mobilenet_hmd_plus_air2"

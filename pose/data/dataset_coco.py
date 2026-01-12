@@ -69,14 +69,30 @@ class CocoKeypointsDataset(Dataset):
         return len(self.annotations)
 
     def __getitem__(self, idx):
-        ann = self.annotations[idx]
-        image_info = self.images[ann["image_id"]]
-        file_name = image_info["file_name"]
-        img_path = os.path.join(self.image_root, file_name)
+        # Robust to stale annotations: if an image referenced by the JSON is
+        # missing on disk, skip it (print warning) and keep training.
+        if not hasattr(self, "_missing_image_warned"):
+            self._missing_image_warned = set()
 
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            raise FileNotFoundError(img_path)
+        max_tries = 20
+        for attempt in range(max_tries):
+            ann = self.annotations[idx]
+            image_info = self.images[ann["image_id"]]
+            file_name = image_info["file_name"]
+            img_path = os.path.join(self.image_root, file_name)
+
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                if img_path not in self._missing_image_warned:
+                    print(f"[mini_pose][WARN] Missing/unreadable image: {img_path}. Skipping.")
+                    self._missing_image_warned.add(img_path)
+                idx = (idx + 1) % len(self.annotations)
+                continue
+            break
+        else:
+            raise RuntimeError(
+                f"Too many missing/unreadable images (>{max_tries}) while sampling from {self.json_path}."
+            )
 
         # Base keypoints in original image coords
         kpts = np.array(ann["keypoints"], dtype=np.float32).reshape(-1, 3)

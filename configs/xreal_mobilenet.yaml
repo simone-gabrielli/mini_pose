@@ -3,20 +3,20 @@ seed: 42
 
 data:
   type: coco_keypoints
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
-  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/train.json"
+  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/val.json"
+  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
   input_size: [256, 256]      # should match Albumentations + head stride
   heatmap_size: [64, 64]
   batch_size: 32               # can be higher than hourglass due to lower mem
   num_workers: 0
   aug:
     use_bbox_crop: true
-    face_margin: 0.25
+    face_margin: 0.5
     rotation: 30
     scale: 0.1
     color_jitter: 0.10
-    aug_factor: 2
+    aug_factor: 1
     content:
       brightness_contrast_p: 0.5
       sunflare_p: 0.1
@@ -40,7 +40,7 @@ loss:
   name: heatmap_mse
 
 train:
-  epochs: 400
+  epochs: 80
   lr: 0.0005
   weight_decay: 0.0001
   optimizer: adam

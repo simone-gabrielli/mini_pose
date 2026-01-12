@@ -11,7 +11,7 @@ from pose.data.transforms import BasicTransform
 import inspect
 
 
-def load_model(checkpoint_path, model_name, num_keypoints, device="cuda"):
+def load_model(checkpoint_path, model_name, num_keypoints, device="cuda", weights_only=True):
     try:
         ModelCls = MODEL_REGISTRY[model_name]
     except KeyError:
@@ -19,7 +19,7 @@ def load_model(checkpoint_path, model_name, num_keypoints, device="cuda"):
         raise KeyError(f"Model '{model_name}' not found in MODEL_REGISTRY. Available models: {available}")
 
     # Load checkpoint first so we can attempt to infer model constructor args
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=weights_only)
     # checkpoint may either be a mapping with key 'model' or already be a state_dict
     state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
 

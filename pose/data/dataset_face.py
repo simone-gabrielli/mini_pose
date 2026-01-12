@@ -95,9 +95,26 @@ class CocoFaceDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
-        it = self.items[idx]
-        img = cv2.imread(it["path"])
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if not hasattr(self, "_missing_image_warned"):
+            self._missing_image_warned = set()
+
+        max_tries = 20
+        for attempt in range(max_tries):
+            it = self.items[idx]
+            img = cv2.imread(it["path"])
+            if img is None:
+                p = it.get("path")
+                if p and p not in self._missing_image_warned:
+                    print(f"[mini_pose][WARN] Missing/unreadable image: {p}. Skipping.")
+                    self._missing_image_warned.add(p)
+                idx = (idx + 1) % len(self.items)
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            break
+        else:
+            raise RuntimeError(
+                f"Too many missing/unreadable images (>{max_tries}) while sampling from {self.json_path}."
+            )
         H, W = img.shape[:2]
         bbox = it["bbox"]
         if bbox is None:

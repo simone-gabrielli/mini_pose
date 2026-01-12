@@ -14,6 +14,7 @@ import pose.models    # noqa: F401  # ensures models register
 import pose.losses    # noqa: F401  # ensures losses register
 from pose.registry import MODEL_REGISTRY, LOSS_REGISTRY, DATASET_REGISTRY
 from pose.engine.metrics import compute_pck, compute_nme
+from pose.data import DatasetSpec, WeightedConcatDataset
 
 class Trainer:
     def __init__(self, cfg: Dict[str, Any], device: str = "cuda"):
@@ -23,30 +24,93 @@ class Trainer:
         # Dataset
         ds_cfg = cfg["data"]
         DatasetCls = DATASET_REGISTRY[ds_cfg["type"]]
-        common_kwargs = dict(
-            image_root=ds_cfg["image_root"],
+        base_kwargs = dict(
             input_size=tuple(ds_cfg["input_size"]),
             heatmap_size=tuple(ds_cfg["heatmap_size"]),
-            aug_cfg=ds_cfg.get("aug", None),
         )
 
         # Optional: forward sigma from config into dataset so GT heatmaps
         # are generated at the requested spatial resolution with matching sigma.
         if "sigma" in ds_cfg:
-            common_kwargs["sigma"] = ds_cfg["sigma"]
+            base_kwargs["sigma"] = ds_cfg["sigma"]
 
 
         # Pass optional 3D-related kwargs if the dataset supports them
         if "depth_bins" in ds_cfg:
-            common_kwargs["depth_bins"] = ds_cfg["depth_bins"]
+            base_kwargs["depth_bins"] = ds_cfg["depth_bins"]
 
-        self.train_ds = DatasetCls(
-            json_path=ds_cfg["train_json"],
-            **common_kwargs,
-        )
+        # Multi-dataset training (optional)
+        #
+        # Backward-compatible (single dataset):
+        #   data: { train_json, val_json, image_root, ... }
+        # Multi-dataset (train only):
+        #   data:
+        #     train_datasets:
+        #       - name: hmd_xreal
+        #         train_json: ...
+        #         image_root: ...
+        #         loss_weight: 1.0
+        #       - name: air2
+        #         train_json: ...
+        #         image_root: ...
+        #         loss_weight: 0.5
+        #     val_json: ...
+        #     val_image_root: ...
+        train_specs = []
+        if isinstance(ds_cfg.get("train_datasets"), list) and len(ds_cfg.get("train_datasets")) > 0:
+            for item in ds_cfg["train_datasets"]:
+                if not isinstance(item, dict):
+                    raise ValueError("Each entry in data.train_datasets must be a dict")
+
+                train_json = item.get("train_json") or item.get("json_path")
+                if not isinstance(train_json, str):
+                    raise ValueError("Each train dataset must provide train_json (or json_path) as a string")
+
+                image_root = item.get("image_root")
+                if not isinstance(image_root, str):
+                    raise ValueError("Each train dataset must provide image_root as a string")
+
+                aug_cfg = item.get("aug", ds_cfg.get("aug", None))
+
+                ds = DatasetCls(
+                    json_path=train_json,
+                    image_root=image_root,
+                    aug_cfg=aug_cfg,
+                    **base_kwargs,
+                )
+
+                loss_weight = float(item.get("loss_weight", 1.0))
+                name = item.get("name")
+                train_specs.append(DatasetSpec(dataset=ds, loss_weight=loss_weight, name=name))
+
+            self.train_ds = WeightedConcatDataset(train_specs)
+        else:
+            # single dataset (current behavior)
+            self.train_ds = DatasetCls(
+                json_path=ds_cfg["train_json"],
+                image_root=ds_cfg["image_root"],
+                aug_cfg=ds_cfg.get("aug", None),
+                **base_kwargs,
+            )
+
+        # Validation dataset (single dataset)
+        val_json = ds_cfg["val_json"]
+        val_image_root = ds_cfg.get("val_image_root")
+        if val_image_root is None:
+            # fall back to legacy key, or the first train dataset's root
+            val_image_root = ds_cfg.get("image_root")
+            if val_image_root is None and train_specs:
+                val_image_root = getattr(train_specs[0].dataset, "image_root", None)
+        if not isinstance(val_image_root, str):
+            raise ValueError(
+                "Validation requires data.val_image_root (or data.image_root for single-dataset configs)."
+            )
+
         self.val_ds = DatasetCls(
-            json_path=ds_cfg["val_json"],
-            **common_kwargs,
+            json_path=val_json,
+            image_root=val_image_root,
+            aug_cfg=ds_cfg.get("val_aug", ds_cfg.get("aug", None)),
+            **base_kwargs,
         )
 
         self.train_loader = DataLoader(
@@ -205,6 +269,9 @@ class Trainer:
         running_loss = 0.0
         for batch in pbar:
             imgs = batch["image"].to(self.device)
+            sample_weight = batch.get("dataset_weight")
+            if sample_weight is not None:
+                sample_weight = sample_weight.to(self.device)
 
             loss_name = self.cfg.get("loss", {}).get("name", "")
 
@@ -224,7 +291,7 @@ class Trainer:
                 if weights is not None:
                     weights = weights.to(self.device)
 
-                loss = self.criterion(preds_2d, targets_2d, weights)
+                loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
 
             else:
                 # Heatmap-based training (existing behaviour)
@@ -245,7 +312,7 @@ class Trainer:
                     loss = 0.0
                     for i in range(len(preds_all)):
                         p = preds_all[i]
-                        loss += self.criterion(p, targets, visible)
+                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
                         if depth_targets is not None and hasattr(self, 'depth_criterion'):
                             d = depth_all[i]
                             loss += self.depth_criterion(d, depth_targets)
@@ -253,11 +320,17 @@ class Trainer:
                     preds_last, preds_all = out
                     loss = 0.0
                     for p in preds_all:
-                        loss += self.criterion(p, targets, visible)
+                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
 
                     if loss_name == "heatmap_3d_mse":
                         hm_targets = batch["heatmaps"].to(self.device)
-                        aux_loss = self._mse2d(preds_last, hm_targets)
+                        if sample_weight is None:
+                            aux_loss = self._mse2d(preds_last, hm_targets)
+                        else:
+                            err2d = (preds_last - hm_targets) ** 2
+                            per_sample = err2d.view(err2d.size(0), -1).mean(dim=1)
+                            sw = sample_weight.to(dtype=per_sample.dtype).view(-1)
+                            aux_loss = (per_sample * sw).sum() / sw.sum().clamp(min=1e-6)
                         loss = loss + self.aux_2d_weight * aux_loss
 
             self.optimizer.zero_grad()
@@ -285,6 +358,9 @@ class Trainer:
 
         for batch in pbar:
             imgs = batch["image"].to(self.device)
+            sample_weight = batch.get("dataset_weight")
+            if sample_weight is not None:
+                sample_weight = sample_weight.to(self.device)
 
             if loss_name == "pose_reprojection":
                 out = self.model(imgs)
@@ -301,7 +377,7 @@ class Trainer:
                 if weights is not None:
                     weights = weights.to(self.device)
 
-                loss = self.criterion(preds_2d, targets_2d, weights)
+                loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
                 preds_last = None  # no heatmaps here
 
             else:
@@ -321,7 +397,7 @@ class Trainer:
                     loss = 0.0
                     for i in range(len(preds_all)):
                         p = preds_all[i]
-                        loss += self.criterion(p, targets, visible)
+                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
                         if depth_targets is not None and hasattr(self, 'depth_criterion'):
                             d = depth_all[i]
                             loss += self.depth_criterion(d, depth_targets)
@@ -329,7 +405,7 @@ class Trainer:
                     preds_last, preds_all = out
                     loss = 0.0
                     for p in preds_all:
-                        loss += self.criterion(p, targets, visible)
+                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
 
             # Only compute PCK/NME if we actually have heatmaps
             if preds_last is not None and preds_last.dim() == 4:
