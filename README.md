@@ -93,6 +93,13 @@ pip install -e .
 python scripts/train.py --config configs/face68_hourglass.yaml
 ```
 
+### Train on multiple datasets (importance-weighted):
+
+Use `data.train_datasets` to mix multiple COCO-style datasets during training.
+Each dataset can have its own `loss_weight` to scale its contribution to the total loss.
+
+See the full example config at configs/xreal_mobilenet_hmd_plus_air2.yaml.
+
 ### Run inference:
 
 ```bash
@@ -374,9 +381,6 @@ torch.onnx.export(model, dummy_input, "pose.onnx", opset=17)
 
 ## 10. Next Steps (Optional)
 
-- Add SimpleBaseline  
-- Add HRNet  
-- Add ViTPose-lite  
-- Add ONNX/TensorRT deployment  
+- Add sampling rebalancing for multi-dataset
 - Add TensorBoard logging  
 - Add Mixup/Mosaic keypoint augmentations  

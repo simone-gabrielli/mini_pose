@@ -21,12 +21,53 @@ import torch
 import numpy as np
 
 from pose.engine.inference import load_model, decode_heatmaps
-from pose.data.transforms import BasicTransform
 
 
 def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int, int] = (0, 0, 255)):
     for (xk, yk) in coords:
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
+
+
+def _preprocess_rgb_to_tensor(img_rgb: np.ndarray, input_size: int) -> torch.Tensor:
+    """Match training pipeline normalization (ImageNet mean/std) and resize."""
+    img_rgb = cv2.resize(img_rgb, (int(input_size), int(input_size)), interpolation=cv2.INTER_LINEAR)
+    img = img_rgb.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img = (img - mean) / std
+    img = img.transpose(2, 0, 1)
+    return torch.from_numpy(img).float()
+
+
+def _extract_preds_last(model_out: object) -> torch.Tensor:
+    """Match Trainer._visualize_model_outputs selection logic."""
+    if isinstance(model_out, tuple):
+        if len(model_out) >= 1 and isinstance(model_out[0], torch.Tensor):
+            return model_out[0]
+        if len(model_out) >= 2 and isinstance(model_out[1], (list, tuple)):
+            return model_out[1][-1]
+    if isinstance(model_out, torch.Tensor):
+        return model_out
+    raise TypeError(f"Unsupported model output type for heatmaps: {type(model_out)}")
+
+
+def _load_coco_bboxes_in_annotation_order(coco_json_path: str) -> list[tuple[float, float, float, float]]:
+    import json
+
+    with open(coco_json_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
+
+    anns = coco.get("annotations", [])
+    out: list[tuple[float, float, float, float]] = []
+    for a in anns:
+        b = a.get("bbox", None)
+        if b is None or len(b) != 4:
+            out.append((0.0, 0.0, 0.0, 0.0))
+            continue
+        out.append((float(b[0]), float(b[1]), float(b[2]), float(b[3])))
+    if not out:
+        raise ValueError(f"No annotations/bboxes found in {coco_json_path}")
+    return out
 
 
 def build_detector(
@@ -217,16 +258,23 @@ def main():
     parser.add_argument("--num-keypoints", type=int, default=68)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--input-size", type=int, default=256)
+    parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around detected face box (training default)")
+
+    # If your input video is built from a COCO dataset (frames are the dataset images
+    # in the same order as COCO annotations), you can bypass detection entirely and
+    # use the dataset bbox for cropping. This matches training/val much closer.
+    parser.add_argument("--coco-json", default=None, help="Optional COCO json; if set, uses bboxes in annotation order per frame")
     parser.add_argument("--detector", choices=["auto", "mtcnn", "yunet", "dlib", "composite", "haar"], default="auto")
     parser.add_argument("--yunet-model", default=None, help="Path to YuNet ONNX model (required if --detector yunet)")
-    parser.add_argument("--yunet-score", type=float, default=0.8, help="YuNet score threshold")
+    parser.add_argument("--yunet-score", type=float, default=0.4, help="YuNet score threshold")
     parser.add_argument("--yunet-nms", type=float, default=0.3, help="YuNet NMS threshold")
     parser.add_argument("--yunet-topk", type=int, default=5000, help="YuNet top_k")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--max-faces", type=int, default=4)
     parser.add_argument("--skip-frames", type=int, default=1)
     parser.add_argument("--draw-face-box", action="store_true")
-    parser.add_argument("--box-pad", type=int, default=50, help="Pixel padding added around detected face box")
+    # Default to 0 because training bbox-crop doesn't add arbitrary padding.
+    parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
     parser.add_argument("--display", action="store_true", help="Show real-time preview window")
     parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
     parser.add_argument(
@@ -302,8 +350,11 @@ def main():
         yunet_nms_thresh=args.yunet_nms,
         yunet_top_k=args.yunet_topk,
     )
-    tfm = BasicTransform(input_size=(args.input_size, args.input_size))
 
+    coco_bboxes = None
+    if args.coco_json:
+        coco_bboxes = _load_coco_bboxes_in_annotation_order(args.coco_json)
+        print(f"Loaded {len(coco_bboxes)} COCO bboxes from {args.coco_json}. Using bbox-per-frame mode (annotation order).")
     frame_idx = 0
     t_start = time.time()
     processed = 0
@@ -390,11 +441,22 @@ def main():
                 frame_idx += 1
                 continue
 
-            # Face detection (optionally cached)
+            # Face detection OR COCO bbox-per-frame mode
             t0 = perf_counter() if args.profile else None
             do_detect = (processed - last_detect_frame) >= max(1, args.detect_every)
             boxes = last_boxes
-            if do_detect:
+
+            if coco_bboxes is not None:
+                # Bbox-per-frame: assumes each processed frame corresponds to the next COCO annotation.
+                idx = processed
+                if idx >= len(coco_bboxes):
+                    break
+                x, y, bw, bh = coco_bboxes[idx]
+                boxes = [(int(x), int(y), int(bw), int(bh))]
+                last_boxes = boxes
+                last_detect_frame = processed
+                do_detect = True
+            elif do_detect:
                 det_frame = frame_bgr
                 scale = float(args.detector_scale)
                 if scale != 1.0 and scale > 0:
@@ -412,6 +474,7 @@ def main():
                     boxes = scaled
                 last_boxes = boxes
                 last_detect_frame = processed
+
             if args.profile:
                 prof["detect"] += perf_counter() - t0
 
@@ -427,7 +490,7 @@ def main():
                 boxes_clamped = []
                 for box in boxes[: args.max_faces]:
                     x, y, w, h = box
-                    margin = 0.25
+                    margin = float(args.face_margin)
                     cx = x + w / 2.0
                     cy = y + h / 2.0
                     size = max(w, h) * (1.0 + margin)
@@ -447,7 +510,7 @@ def main():
                         continue
 
                     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-                    img_t, _ = tfm(face_rgb, keypoints=kpts_dummy)
+                    img_t = _preprocess_rgb_to_tensor(face_rgb, input_size=args.input_size)
                     faces.append(img_t)
                     boxes_clamped.append((x1, y1, x2, y2))
 
@@ -476,12 +539,7 @@ def main():
                         if args.profile:
                             prof["forward"] += perf_counter() - t0
 
-                    if isinstance(preds, (tuple, list)):
-                        preds_last = preds[0]
-                    elif isinstance(preds, dict) and "preds_last" in preds:
-                        preds_last = preds["preds_last"]
-                    else:
-                        preds_last = preds
+                    preds_last = _extract_preds_last(preds)
 
                     t0 = perf_counter() if args.profile else None
                     preds_last = preds_last.cpu()
