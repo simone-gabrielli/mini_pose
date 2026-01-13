@@ -2,12 +2,104 @@
 
 import os
 import shutil
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Any
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+
+
+class ModelEMA:
+    """Exponential Moving Average (EMA) of model parameters.
+
+    Keeps a shadow copy of parameters updated as:
+        ema = decay * ema + (1 - decay) * param
+
+    Designed for easy evaluation via a temporary weight swap.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999, device: torch.device | None = None):
+        self.decay = float(decay)
+        self._shadow: dict[str, torch.Tensor] = {}
+        self._device = device
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if not torch.is_floating_point(p.data):
+                continue
+            t = p.detach().clone()
+            if device is not None:
+                t = t.to(device=device)
+            self._shadow[name] = t
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if name not in self._shadow:
+                continue
+            if not torch.is_floating_point(p.data):
+                continue
+            src = p.detach()
+            if self._device is not None:
+                src = src.to(device=self._device)
+            self._shadow[name].mul_(d).add_(src, alpha=(1.0 - d))
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.detach().cpu() for k, v in self._shadow.items()},
+        }
+
+    def load_state_dict(self, state: dict):
+        if not isinstance(state, dict):
+            return
+        if "decay" in state:
+            self.decay = float(state["decay"])
+        shadow = state.get("shadow")
+        if not isinstance(shadow, dict):
+            return
+        for k, v in shadow.items():
+            if k not in self._shadow:
+                continue
+            try:
+                t = v
+                if not isinstance(t, torch.Tensor):
+                    continue
+                if self._device is not None:
+                    t = t.to(device=self._device)
+                else:
+                    # keep on current model device if available
+                    t = t.to(device=self._shadow[k].device)
+                self._shadow[k].copy_(t)
+            except Exception:
+                continue
+
+    @contextmanager
+    def apply_to(self, model: torch.nn.Module):
+        """Temporarily copy EMA weights into model parameters."""
+        backup: dict[str, torch.Tensor] = {}
+        try:
+            for name, p in model.named_parameters():
+                if name not in self._shadow:
+                    continue
+                if not torch.is_floating_point(p.data):
+                    continue
+                backup[name] = p.detach().clone()
+                src = self._shadow[name]
+                # If EMA is stored on CPU, copy to param device.
+                if src.device != p.device:
+                    src = src.to(device=p.device)
+                p.data.copy_(src)
+            yield
+        finally:
+            for name, p in model.named_parameters():
+                if name not in backup:
+                    continue
+                p.data.copy_(backup[name].to(device=p.device))
 
 import pose.data      # noqa: F401  # ensures datasets register
 import pose.models    # noqa: F401  # ensures models register
@@ -162,20 +254,102 @@ class Trainer:
 
         # Optimizer
         train_cfg = cfg["train"]
-        if train_cfg["optimizer"] == "adam":
+        opt_name = str(train_cfg.get("optimizer", "adam")).lower()
+        lr = float(train_cfg["lr"])
+        weight_decay = float(train_cfg.get("weight_decay", 0.0))
+        betas = tuple(train_cfg.get("betas", [0.9, 0.999]))
+
+        if opt_name == "adam":
             self.optimizer = torch.optim.Adam(
                 self.model.parameters(),
-                lr=train_cfg["lr"],
-                weight_decay=train_cfg.get("weight_decay", 0.0),
+                lr=lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            )
+        elif opt_name == "adamw":
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=lr,
+                betas=betas,
+                weight_decay=weight_decay,
             )
         else:
-            raise ValueError("Unsupported optimizer")
+            raise ValueError(f"Unsupported optimizer: {opt_name}")
 
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer,
-            milestones=train_cfg.get("lr_steps", [30, 50]),
-            gamma=train_cfg.get("lr_gamma", 0.1),
-        )
+        # Scheduler (backward compatible default: MultiStepLR)
+        sched_name = str(train_cfg.get("lr_schedule", "multistep")).lower()
+        if sched_name == "multistep":
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer,
+                milestones=train_cfg.get("lr_steps", [30, 50]),
+                gamma=train_cfg.get("lr_gamma", 0.1),
+            )
+        elif sched_name in ("cosine_warmup", "cosine", "cosine_with_warmup"):
+            warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
+            min_lr = float(train_cfg.get("min_lr", 0.0))
+            warmup_start_factor = float(train_cfg.get("warmup_start_factor", 0.1))
+            if warmup_epochs < 0:
+                warmup_epochs = 0
+            if warmup_start_factor <= 0:
+                warmup_start_factor = 1e-4
+
+            total_epochs = int(train_cfg["epochs"])
+            cosine_epochs = max(1, total_epochs - warmup_epochs)
+
+            if warmup_epochs > 0:
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=warmup_start_factor,
+                    total_iters=warmup_epochs,
+                )
+                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=cosine_epochs,
+                    eta_min=min_lr,
+                )
+                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=cosine_epochs,
+                    eta_min=min_lr,
+                )
+        else:
+            raise ValueError(f"Unsupported lr_schedule: {sched_name}")
+
+        # Regularization bundle flags
+        self.grad_clip_norm = float(train_cfg.get("grad_clip_norm", 0.0))
+        self.grad_clip_norm = max(0.0, self.grad_clip_norm)
+
+        amp_cfg = train_cfg.get("amp", {}) or {}
+        self.use_amp = bool(amp_cfg.get("enabled", False)) and self.device.type == "cuda"
+        amp_dtype = str(amp_cfg.get("dtype", "fp16")).lower()
+        if amp_dtype in ("bf16", "bfloat16"):
+            self.amp_dtype = torch.bfloat16
+            # GradScaler is typically not needed for bf16; still safe to keep enabled=False.
+            self.scaler = torch.cuda.amp.GradScaler(enabled=False)
+        else:
+            self.amp_dtype = torch.float16
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
+        ema_cfg = train_cfg.get("ema", {}) or {}
+        self.use_ema = bool(ema_cfg.get("enabled", False))
+        self.ema_eval = bool(ema_cfg.get("eval", True))
+        self.ema_decay = float(ema_cfg.get("decay", 0.999))
+        self.ema_device = ema_cfg.get("device", None)
+        if isinstance(self.ema_device, str):
+            self.ema_device = torch.device(self.ema_device)
+        else:
+            self.ema_device = None
+        self.ema_update_every = int(ema_cfg.get("update_every", 1))
+        if self.ema_update_every < 1:
+            self.ema_update_every = 1
+
+        self.ema = ModelEMA(self.model, decay=self.ema_decay, device=self.ema_device) if self.use_ema else None
 
         self.epochs = train_cfg["epochs"]
         self.output_dir = train_cfg.get("output_dir", "work_dirs")
@@ -267,6 +441,7 @@ class Trainer:
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [train]")
         running_loss = 0.0
+        step_idx = 0
         for batch in pbar:
             imgs = batch["image"].to(self.device)
             sample_weight = batch.get("dataset_weight")
@@ -282,88 +457,114 @@ class Trainer:
                 "nme", "combined_landmark"
             ]
 
-            # Branch: direct pose regression with reprojection loss
-            if loss_name == "pose_reprojection":
-                out = self.model(imgs)
-                if isinstance(out, dict):
-                    preds_2d = out.get("proj")
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # Mixed precision: wrap forward+loss; choose dtype.
+            autocast_ctx = (
+                torch.cuda.amp.autocast(dtype=self.amp_dtype)
+                if self.use_amp and self.device.type == "cuda"
+                else nullcontext()
+            )
+
+            with autocast_ctx:
+                # Branch: direct pose regression with reprojection loss
+                if loss_name == "pose_reprojection":
+                    out = self.model(imgs)
+                    if isinstance(out, dict):
+                        preds_2d = out.get("proj")
+                    else:
+                        preds_2d = out
+
+                    if preds_2d is None:
+                        raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
+
+                    targets_2d = batch["keypoints"][:, :, :2].to(self.device)
+                    weights = batch.get("pose_weights")
+                    if weights is not None:
+                        weights = weights.to(self.device)
+
+                    loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
+
+                # Branch: coordinate regression losses (LOTR, etc.)
+                elif loss_name in coord_regression_losses:
+                    targets_2d = batch["keypoints"][:, :, :2].to(self.device)
+                    visible = batch["visible"].to(self.device)
+
+                    out = self.model(imgs)
+
+                    # LOTR returns (normalized_coords, pixel_coords)
+                    if isinstance(out, tuple) and len(out) == 2:
+                        _, landmarks_pixel = out
+                        # Use pixel coordinates for loss computation
+                        preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                    else:
+                        preds_2d = out
+                        if preds_2d.dim() == 2:
+                            # If flat output, reshape to (B, N, 2)
+                            B = imgs.size(0)
+                            preds_2d = preds_2d.view(B, -1, 2)
+
+                    loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
+
                 else:
-                    preds_2d = out
-
-                if preds_2d is None:
-                    raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
-
-                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
-                weights = batch.get("pose_weights")
-                if weights is not None:
-                    weights = weights.to(self.device)
-
-                loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
-
-            # Branch: coordinate regression losses (LOTR, etc.)
-            elif loss_name in coord_regression_losses:
-                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
-                visible = batch["visible"].to(self.device)
-
-                out = self.model(imgs)
-                
-                # LOTR returns (normalized_coords, pixel_coords)
-                if isinstance(out, tuple) and len(out) == 2:
-                    landmarks_norm, landmarks_pixel = out
-                    # Use pixel coordinates for loss computation
-                    preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
-                else:
-                    preds_2d = out
-                    if preds_2d.dim() == 2:
-                        # If flat output, reshape to (B, N, 2)
-                        B = imgs.size(0)
-                        preds_2d = preds_2d.view(B, -1, 2)
-
-                loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
-
-            else:
-                # Heatmap-based training (existing behaviour)
-                if loss_name == "heatmap_3d_mse":
-                    targets = batch["heatmaps_3d"].to(self.device)
-                else:
-                    targets = batch["heatmaps"].to(self.device)
-
-                visible = batch["visible"].to(self.device)
-                depth_targets = batch.get("depth", None)
-                if depth_targets is not None:
-                    depth_targets = depth_targets.to(self.device)
-
-                out = self.model(imgs)
-                # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
-                if isinstance(out, tuple) and len(out) == 4:
-                    preds_last, preds_all, depth_last, depth_all = out
-                    loss = 0.0
-                    for i in range(len(preds_all)):
-                        p = preds_all[i]
-                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-                        if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                            d = depth_all[i]
-                            loss += self.depth_criterion(d, depth_targets)
-                else:
-                    preds_last, preds_all = out
-                    loss = 0.0
-                    for p in preds_all:
-                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-
+                    # Heatmap-based training (existing behaviour)
                     if loss_name == "heatmap_3d_mse":
-                        hm_targets = batch["heatmaps"].to(self.device)
-                        if sample_weight is None:
-                            aux_loss = self._mse2d(preds_last, hm_targets)
-                        else:
-                            err2d = (preds_last - hm_targets) ** 2
-                            per_sample = err2d.view(err2d.size(0), -1).mean(dim=1)
-                            sw = sample_weight.to(dtype=per_sample.dtype).view(-1)
-                            aux_loss = (per_sample * sw).sum() / sw.sum().clamp(min=1e-6)
-                        loss = loss + self.aux_2d_weight * aux_loss
+                        targets = batch["heatmaps_3d"].to(self.device)
+                    else:
+                        targets = batch["heatmaps"].to(self.device)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+                    visible = batch["visible"].to(self.device)
+                    depth_targets = batch.get("depth", None)
+                    if depth_targets is not None:
+                        depth_targets = depth_targets.to(self.device)
+
+                    out = self.model(imgs)
+                    # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
+                    if isinstance(out, tuple) and len(out) == 4:
+                        preds_last, preds_all, depth_last, depth_all = out
+                        loss = 0.0
+                        for i in range(len(preds_all)):
+                            p = preds_all[i]
+                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
+                            if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                                d = depth_all[i]
+                                loss += self.depth_criterion(d, depth_targets)
+                    else:
+                        preds_last, preds_all = out
+                        loss = 0.0
+                        for p in preds_all:
+                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
+
+                        if loss_name == "heatmap_3d_mse":
+                            hm_targets = batch["heatmaps"].to(self.device)
+                            if sample_weight is None:
+                                aux_loss = self._mse2d(preds_last, hm_targets)
+                            else:
+                                err2d = (preds_last - hm_targets) ** 2
+                                per_sample = err2d.view(err2d.size(0), -1).mean(dim=1)
+                                sw = sample_weight.to(dtype=per_sample.dtype).view(-1)
+                                aux_loss = (per_sample * sw).sum() / sw.sum().clamp(min=1e-6)
+                            loss = loss + self.aux_2d_weight * aux_loss
+
+            # Backward + step
+            if self.use_amp and self.device.type == "cuda" and self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+                if self.grad_clip_norm > 0:
+                    # unscale before clipping
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
+                self.optimizer.step()
+
+            # EMA update
+            if self.ema is not None and (step_idx % self.ema_update_every == 0):
+                self.ema.update(self.model)
+            step_idx += 1
 
             running_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
@@ -392,109 +593,113 @@ class Trainer:
         coord_targets = []
         is_coord_regression = loss_name in coord_regression_losses
 
-        for batch in pbar:
-            imgs = batch["image"].to(self.device)
-            sample_weight = batch.get("dataset_weight")
-            if sample_weight is not None:
-                sample_weight = sample_weight.to(self.device)
+        # Optionally evaluate EMA weights.
+        eval_ctx = self.ema.apply_to(self.model) if (self.ema is not None and self.ema_eval) else nullcontext()
 
-            if loss_name == "pose_reprojection":
-                out = self.model(imgs)
-                if isinstance(out, dict):
-                    preds_2d = out.get("proj")
+        with eval_ctx:
+            for batch in pbar:
+                imgs = batch["image"].to(self.device)
+                sample_weight = batch.get("dataset_weight")
+                if sample_weight is not None:
+                    sample_weight = sample_weight.to(self.device)
+
+                if loss_name == "pose_reprojection":
+                    out = self.model(imgs)
+                    if isinstance(out, dict):
+                        preds_2d = out.get("proj")
+                    else:
+                        preds_2d = out
+
+                    if preds_2d is None:
+                        raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
+
+                    targets_2d = batch["keypoints"][:, :, :2].to(self.device)
+                    weights = batch.get("pose_weights")
+                    if weights is not None:
+                        weights = weights.to(self.device)
+
+                    loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
+                    preds_last = None  # no heatmaps here
+
+                elif is_coord_regression:
+                    # Coordinate regression validation (LOTR-style)
+                    targets_2d = batch["keypoints"][:, :, :2].to(self.device)
+                    visible = batch["visible"].to(self.device)
+
+                    out = self.model(imgs)
+
+                    # LOTR returns (normalized_coords, pixel_coords)
+                    if isinstance(out, tuple) and len(out) == 2:
+                        _, landmarks_pixel = out
+                        preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                    else:
+                        preds_2d = out
+                        if preds_2d.dim() == 2:
+                            B = imgs.size(0)
+                            preds_2d = preds_2d.view(B, -1, 2)
+
+                    loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
+                    preds_last = None  # no heatmaps
+
+                    # Collect predictions and targets for NME computation
+                    for b in range(preds_2d.size(0)):
+                        pred_coords = preds_2d[b].cpu().numpy()
+                        target_coords = targets_2d[b].cpu().numpy()
+                        coord_preds.append(pred_coords)
+                        coord_targets.append(target_coords)
+
                 else:
-                    preds_2d = out
+                    if loss_name == "heatmap_3d_mse":
+                        targets = batch["heatmaps_3d"].to(self.device)
+                    else:
+                        targets = batch["heatmaps"].to(self.device)
 
-                if preds_2d is None:
-                    raise RuntimeError("Model must return projected 2D points 'proj' for pose_reprojection loss")
+                    visible = batch["visible"].to(self.device)
+                    depth_targets = batch.get("depth", None)
+                    if depth_targets is not None:
+                        depth_targets = depth_targets.to(self.device)
 
-                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
-                weights = batch.get("pose_weights")
-                if weights is not None:
-                    weights = weights.to(self.device)
+                    out = self.model(imgs)
+                    if isinstance(out, tuple) and len(out) == 4:
+                        preds_last, preds_all, depth_last, depth_all = out
+                        loss = 0.0
+                        for i in range(len(preds_all)):
+                            p = preds_all[i]
+                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
+                            if depth_targets is not None and hasattr(self, 'depth_criterion'):
+                                d = depth_all[i]
+                                loss += self.depth_criterion(d, depth_targets)
+                    else:
+                        preds_last, preds_all = out
+                        loss = 0.0
+                        for p in preds_all:
+                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
 
-                loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
-                preds_last = None  # no heatmaps here
+                # Only compute PCK/NME if we actually have heatmaps
+                if preds_last is not None and preds_last.dim() == 4:
+                    # image and heatmap sizes from dataset config
+                    H_img, W_img = self.train_ds.input_size[1], self.train_ds.input_size[0]
+                    H_hm, W_hm = self.train_ds.heatmap_size[1], self.train_ds.heatmap_size[0]
+                    sx = W_hm / float(W_img)
+                    sy = H_hm / float(H_img)
 
-            elif is_coord_regression:
-                # Coordinate regression validation (LOTR-style)
-                targets_2d = batch["keypoints"][:,:,:2].to(self.device)
-                visible = batch["visible"].to(self.device)
+                    for b in range(preds_last.size(0)):
+                        hm = preds_last[b].cpu()  # (K,H,W)
+                        K, H, W = hm.shape
+                        h_flat = hm.view(K, -1)
+                        idx = torch.argmax(h_flat, dim=1)
+                        y = (idx // W).float().numpy()
+                        x = (idx % W).float().numpy()
+                        coords = np.stack([x, y], axis=1)
+                        coord_preds.append(coords)
 
-                out = self.model(imgs)
-                
-                # LOTR returns (normalized_coords, pixel_coords)
-                if isinstance(out, tuple) and len(out) == 2:
-                    landmarks_norm, landmarks_pixel = out
-                    preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
-                else:
-                    preds_2d = out
-                    if preds_2d.dim() == 2:
-                        B = imgs.size(0)
-                        preds_2d = preds_2d.view(B, -1, 2)
+                        # targets: from batch['keypoints'], scaled into heatmap space
+                        t = batch["keypoints"][b].cpu().numpy()[:, :2]
+                        t_hm = np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1)
+                        coord_targets.append(t_hm)
 
-                loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
-                preds_last = None  # no heatmaps
-
-                # Collect predictions and targets for NME computation
-                for b in range(preds_2d.size(0)):
-                    pred_coords = preds_2d[b].cpu().numpy()
-                    target_coords = targets_2d[b].cpu().numpy()
-                    coord_preds.append(pred_coords)
-                    coord_targets.append(target_coords)
-
-            else:
-                if loss_name == "heatmap_3d_mse":
-                    targets = batch["heatmaps_3d"].to(self.device)
-                else:
-                    targets = batch["heatmaps"].to(self.device)
-
-                visible = batch["visible"].to(self.device)
-                depth_targets = batch.get("depth", None)
-                if depth_targets is not None:
-                    depth_targets = depth_targets.to(self.device)
-
-                out = self.model(imgs)
-                if isinstance(out, tuple) and len(out) == 4:
-                    preds_last, preds_all, depth_last, depth_all = out
-                    loss = 0.0
-                    for i in range(len(preds_all)):
-                        p = preds_all[i]
-                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-                        if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                            d = depth_all[i]
-                            loss += self.depth_criterion(d, depth_targets)
-                else:
-                    preds_last, preds_all = out
-                    loss = 0.0
-                    for p in preds_all:
-                        loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-
-            # Only compute PCK/NME if we actually have heatmaps
-            if preds_last is not None and preds_last.dim() == 4:
-                # image and heatmap sizes from dataset config
-                H_img, W_img = self.train_ds.input_size[1], self.train_ds.input_size[0]
-                H_hm, W_hm = self.train_ds.heatmap_size[1], self.train_ds.heatmap_size[0]
-                sx = W_hm / float(W_img)
-                sy = H_hm / float(H_img)
-
-                for b in range(preds_last.size(0)):
-                    hm = preds_last[b].cpu()  # (K,H,W)
-                    K, H, W = hm.shape
-                    h_flat = hm.view(K, -1)
-                    idx = torch.argmax(h_flat, dim=1)
-                    y = (idx // W).float().numpy()
-                    x = (idx % W).float().numpy()
-                    coords = np.stack([x, y], axis=1)
-                    coord_preds.append(coords)
-
-                    # targets: from batch['keypoints'], scaled into heatmap space
-                    t = batch["keypoints"][b].cpu().numpy()[:, :2]
-                    t_hm = np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1)
-                    coord_targets.append(t_hm)
-
-            running_loss += loss.item()
-            pbar.set_postfix(loss=loss.item())
+                running_loss += loss.item()
+                pbar.set_postfix(loss=loss.item())
 
         val_loss = running_loss / len(self.val_loader)
         self.log_metric("val", "loss", val_loss)
@@ -520,14 +725,18 @@ class Trainer:
     def save_checkpoint(self, epoch, best=False):
         name = "best.pth" if best else f"epoch_{epoch}.pth"
         path = os.path.join(self.output_dir, name)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-            },
-            path,
-        )
+        payload = {
+            "epoch": epoch,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+        }
+        if self.scaler is not None and getattr(self.scaler, "is_enabled", None) and self.scaler.is_enabled():
+            payload["scaler"] = self.scaler.state_dict()
+        if self.ema is not None:
+            payload["ema"] = self.ema.state_dict()
+
+        torch.save(payload, path)
         return path
 
     def _save_training_report(self):
@@ -604,7 +813,9 @@ class Trainer:
                 generate_fn(sample, out_path, self.device)
 
     def _load_checkpoint(self, ckpt_path: str):
-        ckpt = torch.load(ckpt_path, map_location=self.device)
+        # weights_only=True keeps the load safe and fast; our checkpoint payload
+        # contains only tensors + dicts of tensors.
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
 
         # 1) Model weights: allow missing / extra keys (e.g., new attention params)
         self.model.load_state_dict(ckpt["model"], strict=False)
@@ -616,6 +827,27 @@ class Trainer:
             except ValueError as e:
                 print(f"Warning: could not load optimizer state ({e}); "
                       f"reinitializing optimizer with current parameters.")
+
+        # 2.5) Scheduler state
+        if "scheduler" in ckpt and ckpt["scheduler"] is not None and self.scheduler is not None:
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as e:
+                print(f"Warning: could not load scheduler state ({e}); using fresh scheduler.")
+
+        # 2.6) AMP scaler state
+        if "scaler" in ckpt and self.scaler is not None and getattr(self.scaler, "is_enabled", None) and self.scaler.is_enabled():
+            try:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            except Exception as e:
+                print(f"Warning: could not load GradScaler state ({e}); using fresh scaler.")
+
+        # 2.7) EMA state
+        if "ema" in ckpt and self.ema is not None:
+            try:
+                self.ema.load_state_dict(ckpt["ema"])
+            except Exception as e:
+                print(f"Warning: could not load EMA state ({e}); using fresh EMA.")
 
         # 3) Resume epoch counter if present
         if "epoch" in ckpt:

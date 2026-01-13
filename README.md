@@ -311,6 +311,45 @@ data:
   batch_size: 16
   num_workers: 4
 
+  # Optional: augmentation config
+  # aug:
+  #   # Horizontal flip is a strong regularizer, but you MUST provide flip_pairs
+  #   # so left/right landmark semantics stay correct.
+  #   hflip_p: 0.5
+  #   flip_pairs:  # 68-point example (0-indexed)
+  #     - [0, 9]
+  #     - [1, 10]
+  #     - [2, 11]
+  #     - [3, 12]
+  #     - [4, 13]
+  #     - [5, 14]
+  #     - [6, 15]
+  #     - [7, 16]
+  #     - [8, 17]
+  #     - [18, 33]
+  #     - [19, 32]
+  #     - [20, 31]
+  #     - [21, 30]
+  #     - [22, 29]
+  #     - [23, 28]
+  #     - [24, 27]
+  #     - [34, 37]
+  #     - [35, 38]
+  #     - [40, 46]
+  #     - [41, 47]
+  #     - [42, 48]
+  #     - [43, 49]
+  #     - [44, 50]
+  #     - [45, 51]
+  #     - [52, 58]
+  #     - [53, 59]
+  #     - [54, 60]
+  #     - [55, 61]
+  #     - [56, 62]
+  #     - [57, 63]
+  #     - [64, 66]
+  #     - [65, 67]
+
 model:
   name: stacked_hourglass
   num_stacks: 2
@@ -328,6 +367,29 @@ train:
   lr_steps: [30, 40]
   lr_gamma: 0.1
   output_dir: "work_dirs/face68_hourglass"
+
+  # --- Optional regularization bundle ---
+  # Optimizer + schedule
+  # optimizer: adamw
+  # lr_schedule: cosine_warmup
+  # warmup_epochs: 5
+  # warmup_start_factor: 0.1
+  # min_lr: 0.0
+
+  # Training stability
+  # grad_clip_norm: 1.0
+
+  # Mixed precision (CUDA only)
+  # amp:
+  #   enabled: true
+  #   dtype: fp16   # fp16 | bf16
+
+  # EMA weights (often improves NME/PCK)
+  # ema:
+  #   enabled: true
+  #   decay: 0.999
+  #   update_every: 1
+  #   eval: true
 ```
 
 ---

@@ -1,4 +1,4 @@
-experiment: xreal_mobilenet_hmd_plus_air2
+experiment: xreal_fan_hmd_plus_air2
 seed: 42
 
 data:
@@ -25,44 +25,41 @@ data:
 
   input_size: [256, 256]
   heatmap_size: [64, 64]
-  batch_size: 32
+  batch_size: 8
   num_workers: 0
   aug:
     use_bbox_crop: true
     face_margin: 0.5
     hflip_p: 0.5
     flip_pairs:
-      - [0, 9]
-      - [1, 10]
-      - [2, 11]
-      - [3, 12]
-      - [4, 13]
-      - [5, 14]
-      - [6, 15]
-      - [7, 16]
-      - [8, 17]
-      - [18, 33]
-      - [19, 32]
-      - [20, 31]
-      - [21, 30]
-      - [22, 29]
-      - [23, 28]
-      - [24, 27]
-      - [34, 37]
-      - [35, 38]
-      - [40, 46]
-      - [41, 47]
-      - [42, 48]
-      - [43, 49]
-      - [44, 50]
-      - [45, 51]
-      - [52, 58]
-      - [53, 59]
-      - [54, 60]
-      - [55, 61]
-      - [56, 62]
-      - [57, 63]
-      - [64, 66]
+      - [0, 16]
+      - [1, 15]
+      - [2, 14]
+      - [3, 13]
+      - [4, 12]
+      - [5, 11]
+      - [6, 10]
+      - [7, 9]
+      - [17, 26]
+      - [18, 25]
+      - [19, 24]
+      - [20, 23]
+      - [21, 22]
+      - [31, 35]
+      - [32, 34]
+      - [36, 45]
+      - [37, 44]
+      - [38, 43]
+      - [39, 42]
+      - [40, 47]
+      - [41, 46]
+      - [48, 54]
+      - [49, 53]
+      - [50, 52]
+      - [55, 59]
+      - [56, 58]
+      - [60, 64]
+      - [61, 63]
       - [65, 67]
     rotation: 30
     scale: 0.1
@@ -78,7 +75,10 @@ data:
       compression_quality: [60, 100]
 
 model:
-  name: mobilenet_pose
+  name: fan_2d
+  num_stacks: 4   # nStacks
+  num_modules: 1  # nModules
+  num_feats: 256  # nFeats
 
 loss:
   name: heatmap_mse
@@ -103,4 +103,4 @@ train:
     decay: 0.999
     update_every: 1
     eval: true
-  output_dir: "work_dirs/xreal_mobilenet_hmd_plus_air2"
+  output_dir: "work_dirs/xreal_fan_hmd_plus_air2"

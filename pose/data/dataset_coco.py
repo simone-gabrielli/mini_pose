@@ -50,6 +50,8 @@ class CocoKeypointsDataset(Dataset):
         self.face_margin = float(aug_cfg.get("face_margin", 0.25))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
+            hflip_p=aug_cfg.get("hflip_p", 0.0),
+            flip_pairs=aug_cfg.get("flip_pairs", None),
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),
             color_jitter=aug_cfg.get("color_jitter", 0.15),

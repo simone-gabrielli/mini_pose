@@ -4,6 +4,44 @@ import torch
 import cv2
 
 
+def _replay_applied_hflip(replay: dict | None) -> bool:
+    """Best-effort check whether a HorizontalFlip was applied.
+
+    Albumentations ReplayCompose stores a nested transform tree in replay.
+    We walk it and look for an applied HorizontalFlip.
+    """
+
+    if not isinstance(replay, dict):
+        return False
+
+    def walk(transforms):
+        if not isinstance(transforms, list):
+            return False
+        for t in transforms:
+            if not isinstance(t, dict):
+                continue
+            # Some entries have nested transforms (OneOf, Compose)
+            if walk(t.get("transforms")):
+                return True
+            name = str(t.get("__class_fullname__", ""))
+            applied = bool(t.get("applied", False))
+            if applied and ("HorizontalFlip" in name or name.endswith(".HorizontalFlip")):
+                return True
+        return False
+
+    return walk(replay.get("transforms"))
+
+
+def _swap_pairs_inplace(arr: np.ndarray, flip_pairs: list[tuple[int, int]]):
+    """Swap rows in-place for each (i, j) pair."""
+    for i, j in flip_pairs:
+        if i == j:
+            continue
+        tmp = arr[i].copy()
+        arr[i] = arr[j]
+        arr[j] = tmp
+
+
 class AlbumentationsKeypointPipeline:
     """A stronger albumentations pipeline for keypoints and optional bboxes.
 
@@ -21,7 +59,8 @@ class AlbumentationsKeypointPipeline:
     def __init__(
         self,
         input_size=(256, 256),
-        # `flip_pairs` removed — pipeline no longer performs keypoint index swapping
+        hflip_p: float = 0.0,
+        flip_pairs: list[list[int]] | list[tuple[int, int]] | None = None,
         rotation=15,
         scale=0.10,
         color_jitter=0.15,
@@ -29,7 +68,19 @@ class AlbumentationsKeypointPipeline:
         content_cfg: dict | None = None,
     ):
         self.input_size = input_size
-        # flip_pairs support removed
+        self.hflip_p = float(hflip_p)
+
+        # Normalize flip_pairs to a list[tuple[int,int]]
+        self.flip_pairs: list[tuple[int, int]] | None = None
+        if flip_pairs is not None:
+            pairs: list[tuple[int, int]] = []
+            for p in flip_pairs:
+                if isinstance(p, (list, tuple)) and len(p) == 2:
+                    pairs.append((int(p[0]), int(p[1])))
+                else:
+                    raise ValueError("flip_pairs must be a list of (i,j) pairs")
+            self.flip_pairs = pairs
+
         content_cfg = content_cfg or {}
 
         # Read content augmentation params (with sensible defaults)
@@ -90,19 +141,35 @@ class AlbumentationsKeypointPipeline:
         # content pipeline: content-only + resize
         content_transforms.append(A.Resize(height=input_size[1], width=input_size[0]))
 
+        # For samples with no bbox we can safely allow flips as well.
+        # For samples WITH a bbox but where we fall back to content-only (degenerate
+        # bbox), we avoid flips so we don't silently desync bbox targets.
+        content_no_bbox_transforms = list(content_transforms)
+        if self.hflip_p > 0:
+            content_no_bbox_transforms.insert(0, A.HorizontalFlip(p=self.hflip_p))
+
         self.content_transform = A.ReplayCompose(
             content_transforms,
             keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
             additional_targets={"image2": "image"},
         )
+        self.content_no_bbox_transform = A.ReplayCompose(
+            content_no_bbox_transforms,
+            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+            additional_targets={"image2": "image"},
+        )
 
         # full pipeline: geometry + content + resize
-        geom_transforms = [
+        geom_transforms = []
+        if self.hflip_p > 0:
+            geom_transforms.append(A.HorizontalFlip(p=self.hflip_p))
+
+        geom_transforms.extend([
             A.OneOf([
                 A.Affine(scale=(1 - scale, 1 + scale), rotate=(-rotation, rotation), interpolation=cv2.INTER_LINEAR, mode=cv2.BORDER_CONSTANT),
                 A.ShiftScaleRotate(shift_limit=0.05, scale_limit=scale, rotate_limit=rotation, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_CONSTANT),
             ], p=0.8),
-        ]
+        ])
         geom_transforms.extend(content_transforms)
 
         self.full_transform = A.ReplayCompose(
@@ -185,11 +252,30 @@ class AlbumentationsKeypointPipeline:
             # image, keypoints and bbox consistently and return updated bboxes.
             augmented = self.full_transform(image=img, keypoints=kpts_xy, bboxes=bboxes)
         else:
-            # Degenerate or missing bbox: avoid geometry transforms that could
-            # produce invalid bboxes; use content-only pipeline instead.
-            augmented = self.content_transform(image=img, keypoints=kpts_xy)
+            # Degenerate bbox: avoid geometry transforms that could produce invalid
+            # bboxes; use content-only pipeline instead.
+            # If bbox is missing entirely, we can safely allow flips.
+            if bbox is None:
+                augmented = self.content_no_bbox_transform(image=img, keypoints=kpts_xy)
+            else:
+                augmented = self.content_transform(image=img, keypoints=kpts_xy)
         new_img = augmented["image"]
         new_kpts = np.array(augmented.get("keypoints", []), dtype=np.float32)
+
+        # If we used HorizontalFlip, the *semantics* of left/right landmarks swap.
+        # Swap keypoint indices according to flip_pairs (if provided).
+        hflipped = _replay_applied_hflip(augmented.get("replay"))
+        if hflipped and self.flip_pairs is not None:
+            # Swap visibility base (if we have it) so occlusion semantics follow the point.
+            if vis is not None and vis.shape[0] > 0:
+                vis_arr = np.array(vis, dtype=np.float32).reshape(-1, 1)
+                if vis_arr.shape[0] == len(kpts_xy):
+                    _swap_pairs_inplace(vis_arr, self.flip_pairs)
+                    vis = vis_arr
+
+            if new_kpts.size != 0:
+                if new_kpts.ndim == 2 and new_kpts.shape[0] >= max(max(i, j) for i, j in self.flip_pairs) + 1:
+                    _swap_pairs_inplace(new_kpts, self.flip_pairs)
 
         # If augmented keypoint count doesn't match original visibility length
         # (some albumentations transforms can behave oddly in replay mode),
@@ -204,6 +290,12 @@ class AlbumentationsKeypointPipeline:
                 if len(kpts_xy) > 0:
                     resized = [[x * scale_x, y * scale_y] for (x, y) in kpts_xy]
                     new_kpts = np.array(resized, dtype=np.float32)
+                    # If we flipped, also flip the resized coords and swap indices.
+                    if hflipped:
+                        iw = float(self.input_size[0])
+                        new_kpts[:, 0] = (iw - 1.0) - new_kpts[:, 0]
+                        if self.flip_pairs is not None:
+                            _swap_pairs_inplace(new_kpts, self.flip_pairs)
                 else:
                     new_kpts = np.zeros((vis.shape[0], 2), dtype=np.float32)
             except Exception:
@@ -219,11 +311,9 @@ class AlbumentationsKeypointPipeline:
             # normalize to [0,1]
             new_bbox = np.array([bx[0] / iw, bx[1] / ih, bx[2] / iw, bx[3] / ih], dtype=np.float32)
 
-        # Previously we swapped keypoint indices on horizontal flip using
-        # configured `flip_pairs`. That logic has been removed: the dataset's
-        # annotations must already be in a consistent order and models should
-        # handle flips via symmetric training or by explicit label mapping
-        # upstream if necessary.
+        # Note: if flip_pairs is provided and HorizontalFlip is enabled,
+        # this pipeline will swap keypoint indices after flipping so the
+        # landmark semantics remain correct.
 
         # Update visibility: mark keypoints outside the output image as invisible.
         # new_kpts contains (x,y) in pixel coords of the transformed/resized image.
