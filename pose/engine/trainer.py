@@ -553,7 +553,7 @@ class Trainer:
 
             # Mixed precision: wrap forward+loss; choose dtype.
             autocast_ctx = (
-                torch.cuda.amp.autocast(dtype=self.amp_dtype)
+                torch.amp.autocast(device=self.device, dtype=self.amp_dtype)
                 if self.use_amp and self.device.type == "cuda"
                 else nullcontext()
             )
@@ -781,9 +781,16 @@ class Trainer:
                 running_loss += float(loss.item())
                 pbar.set_postfix(loss=float(loss.item()))
 
-        val_loss = running_loss / max(1, len(loader))
+        num_batches = int(len(loader))
+        val_loss = running_loss / max(1, num_batches)
 
-        metrics: dict[str, float] = {"loss": float(val_loss)}
+        # Expose both mean loss and the raw sums so the caller can aggregate
+        # across datasets without biasing toward small/large val sets.
+        metrics: dict[str, float] = {
+            "loss": float(val_loss),
+            "_loss_sum": float(running_loss),
+            "_num_batches": float(num_batches),
+        }
         if coord_preds:
             try:
                 coord_preds_arr = np.stack(coord_preds)
@@ -806,19 +813,28 @@ class Trainer:
 
             # Log per-dataset metrics with stable names (no path separators).
             for k, v in per_ds[name].items():
+                if str(k).startswith("_"):
+                    continue
                 self.log_metric("val", f"{k}_{name}", float(v))
 
-        # Aggregate loss across datasets (weighted average).
-        total_w = 0.0
-        agg_loss = 0.0
+        # Aggregate loss across datasets.
+        # Batch-count-aware weighted average:
+        #   Val(agg) = sum_i weight_i * sum_b loss_{i,b} / sum_i weight_i * num_batches_i
+        # This prevents small validation sets from dominating the aggregate.
+        total_w_batches = 0.0
+        agg_loss_sum = 0.0
         for name, m in per_ds.items():
             w = float(self.val_weights.get(name, 1.0))
             if w <= 0:
                 continue
-            total_w += w
-            agg_loss += w * float(m.get("loss", 0.0))
+            loss_sum = float(m.get("_loss_sum", 0.0))
+            n_batches = float(m.get("_num_batches", 0.0))
+            if n_batches <= 0:
+                continue
+            agg_loss_sum += w * loss_sum
+            total_w_batches += w * n_batches
 
-        val_loss = agg_loss / max(1e-12, total_w)
+        val_loss = agg_loss_sum / max(1e-12, total_w_batches)
         self.log_metric("val", "loss", float(val_loss))
 
         # Prefer reporting PCK/NME for the primary dataset (if present).
@@ -914,7 +930,7 @@ class Trainer:
         if generate_fn is None:
             return
 
-        if len(self.val_ds) == 0:
+        if not getattr(self, "val_datasets", None):
             return
 
         # for i in range(num_vis):
@@ -927,14 +943,28 @@ class Trainer:
         #         self._visualize_model_outputs(sample, out_path)
 
         self.model.eval()
-        os.makedirs(os.path.join(self.output_dir, "viz"), exist_ok=True)
+        viz_root = os.path.join(self.output_dir, "viz")
+        os.makedirs(viz_root, exist_ok=True)
 
-        num_vis = min(4, len(self.val_ds))
+        num_vis_cfg = int(self.cfg.get("train", {}).get("num_val_viz", 4))
+        if num_vis_cfg < 0:
+            num_vis_cfg = 0
+
+        def _safe_name(s: str) -> str:
+            s = str(s)
+            return s.replace("/", "_").replace("\\\\", "_")
+
         with torch.no_grad():
-            for i in range(num_vis):
-                sample = self.val_ds[i]
-                out_path = os.path.join(self.output_dir, "viz", f"val_example_{i}.png")
-                generate_fn(sample, out_path, self.device)
+            for ds_name, ds in self.val_datasets.items():
+                if len(ds) == 0:
+                    continue
+                num_vis = min(num_vis_cfg, len(ds))
+                ds_dir = os.path.join(viz_root, _safe_name(ds_name))
+                os.makedirs(ds_dir, exist_ok=True)
+                for i in range(num_vis):
+                    sample = ds[i]
+                    out_path = os.path.join(ds_dir, f"val_example_{i}.png")
+                    generate_fn(sample, out_path, self.device)
 
     def _load_checkpoint(self, ckpt_path: str):
         # weights_only=True keeps the load safe and fast; our checkpoint payload
