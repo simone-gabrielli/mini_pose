@@ -553,7 +553,7 @@ class Trainer:
 
             # Mixed precision: wrap forward+loss; choose dtype.
             autocast_ctx = (
-                torch.amp.autocast(device=self.device, dtype=self.amp_dtype)
+                torch.amp.autocast(self.device.type, dtype=self.amp_dtype)
                 if self.use_amp and self.device.type == "cuda"
                 else nullcontext()
             )
