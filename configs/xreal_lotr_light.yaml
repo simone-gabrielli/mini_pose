@@ -7,8 +7,21 @@ seed: 42
 data:
   type: coco_keypoints
   train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
+
+  # Multi-dataset validation.
+  # Keep air2 as primary (matches previous single-val behavior), but also report metrics on hmd_xreal.
+  primary_val: 300w_xreal_air2
+  val_datasets:
+    - name: 300w_xreal_air2
+      val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
+      weight: 1.0
+
+    - name: hmd_xreal
+      val_json: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
   input_size: [192, 192]      # Smaller input for speed
   heatmap_size: [48, 48]
   batch_size: 64              # Larger batch size due to smaller model

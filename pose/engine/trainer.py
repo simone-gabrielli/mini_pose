@@ -185,40 +185,132 @@ class Trainer:
                 **base_kwargs,
             )
 
-        # Validation dataset (single dataset)
-        val_json = ds_cfg["val_json"]
-        val_image_root = ds_cfg.get("val_image_root")
-        if val_image_root is None:
-            # fall back to legacy key, or the first train dataset's root
-            val_image_root = ds_cfg.get("image_root")
-            if val_image_root is None and train_specs:
-                val_image_root = getattr(train_specs[0].dataset, "image_root", None)
-        if not isinstance(val_image_root, str):
-            raise ValueError(
-                "Validation requires data.val_image_root (or data.image_root for single-dataset configs)."
+        # Validation dataset(s)
+        #
+        # Backward-compatible (single val dataset):
+        #   data: { val_json, val_image_root?, ... }
+        # Multi-dataset validation:
+        #   data:
+        #     val_datasets:
+        #       - name: air2
+        #         val_json: ...
+        #         image_root: ...
+        #         weight: 1.0
+        #       - name: hmd
+        #         val_json: ...
+        #         image_root: ...
+        #         weight: 1.0
+        #     primary_val: air2
+        self.val_loaders: dict[str, DataLoader] = {}
+        self.val_datasets: dict[str, Any] = {}
+        self.val_weights: dict[str, float] = {}
+        self.primary_val_name: str = "val"
+
+        if isinstance(ds_cfg.get("val_datasets"), list) and len(ds_cfg.get("val_datasets")) > 0:
+            primary = ds_cfg.get("primary_val")
+            for i, item in enumerate(ds_cfg["val_datasets"]):
+                if not isinstance(item, dict):
+                    raise ValueError("Each entry in data.val_datasets must be a dict")
+
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    name = f"val{i}"
+
+                val_json = item.get("val_json") or item.get("json_path")
+                if not isinstance(val_json, str):
+                    raise ValueError("Each val dataset must provide val_json (or json_path) as a string")
+
+                image_root = item.get("val_image_root") or item.get("image_root")
+                if not isinstance(image_root, str):
+                    raise ValueError("Each val dataset must provide image_root (or val_image_root) as a string")
+
+                aug_cfg = item.get("val_aug", item.get("aug", ds_cfg.get("val_aug", ds_cfg.get("aug", None))))
+
+                ds = DatasetCls(
+                    json_path=val_json,
+                    image_root=image_root,
+                    aug_cfg=aug_cfg,
+                    **base_kwargs,
+                )
+
+                # allow either `weight` or `loss_weight` for convenience
+                w = item.get("weight", item.get("loss_weight", 1.0))
+                w = float(w)
+                if w < 0:
+                    raise ValueError("Validation dataset weight must be >= 0")
+
+                bs = int(item.get("batch_size", ds_cfg.get("val_batch_size", ds_cfg["batch_size"])))
+                if bs < 1:
+                    raise ValueError("Validation batch_size must be >= 1")
+
+                num_workers = ds_cfg.get("num_workers", 4)
+                loader = DataLoader(
+                    ds,
+                    batch_size=bs,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=(num_workers > 0),
+                )
+
+                self.val_datasets[name] = ds
+                self.val_loaders[name] = loader
+                self.val_weights[name] = w
+
+            if isinstance(primary, str) and primary in self.val_loaders:
+                self.primary_val_name = primary
+            else:
+                # default to the first entry
+                self.primary_val_name = next(iter(self.val_loaders.keys()))
+
+            # Keep legacy attributes pointing at the primary val set.
+            self.val_ds = self.val_datasets[self.primary_val_name]
+            self.val_loader = self.val_loaders[self.primary_val_name]
+        else:
+            # single dataset (current behavior)
+            val_json = ds_cfg["val_json"]
+            val_image_root = ds_cfg.get("val_image_root")
+            if val_image_root is None:
+                # fall back to legacy key, or the first train dataset's root
+                val_image_root = ds_cfg.get("image_root")
+                if val_image_root is None and train_specs:
+                    val_image_root = getattr(train_specs[0].dataset, "image_root", None)
+            if not isinstance(val_image_root, str):
+                raise ValueError(
+                    "Validation requires data.val_image_root (or data.image_root for single-dataset configs)."
+                )
+
+            self.val_ds = DatasetCls(
+                json_path=val_json,
+                image_root=val_image_root,
+                aug_cfg=ds_cfg.get("val_aug", ds_cfg.get("aug", None)),
+                **base_kwargs,
             )
 
-        self.val_ds = DatasetCls(
-            json_path=val_json,
-            image_root=val_image_root,
-            aug_cfg=ds_cfg.get("val_aug", ds_cfg.get("aug", None)),
-            **base_kwargs,
-        )
+            num_workers = ds_cfg.get("num_workers", 4)
+            self.val_loader = DataLoader(
+                self.val_ds,
+                batch_size=int(ds_cfg.get("val_batch_size", ds_cfg["batch_size"])),
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+            )
+            self.val_datasets = {"val": self.val_ds}
+            self.val_loaders = {"val": self.val_loader}
+            self.val_weights = {"val": 1.0}
+            self.primary_val_name = "val"
 
+        num_workers = ds_cfg.get("num_workers", 4)
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=ds_cfg["batch_size"],
             shuffle=True,
-            num_workers=ds_cfg.get("num_workers", 4),
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
         )
-        self.val_loader = DataLoader(
-            self.val_ds,
-            batch_size=ds_cfg["batch_size"],
-            shuffle=False,
-            num_workers=ds_cfg.get("num_workers", 4),
-            pin_memory=True,
-        )
+        # self.val_loader is created above (single or multi-dataset)
 
         num_keypoints = self.train_ds.num_keypoints
 
@@ -331,10 +423,10 @@ class Trainer:
         if amp_dtype in ("bf16", "bfloat16"):
             self.amp_dtype = torch.bfloat16
             # GradScaler is typically not needed for bf16; still safe to keep enabled=False.
-            self.scaler = torch.cuda.amp.GradScaler(enabled=False)
+            self.scaler = torch.amp.GradScaler(device='cuda', enabled=False)
         else:
             self.amp_dtype = torch.float16
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            self.scaler = torch.amp.GradScaler(device='cuda', enabled=self.use_amp)
 
         ema_cfg = train_cfg.get("ema", {}) or {}
         self.use_ema = bool(ema_cfg.get("enabled", False))
@@ -574,23 +666,21 @@ class Trainer:
         return epoch_loss
 
     @torch.no_grad()
-    def validate_epoch(self, epoch: int):
+    def _validate_one(self, epoch: int, name: str, loader: DataLoader, dataset) -> dict[str, float]:
+        """Validate on a single loader and return scalar metrics."""
         self.model.eval()
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [val]")
+        pbar = tqdm(loader, desc=f"Epoch {epoch} [val:{name}]")
         running_loss = 0.0
         loss_name = self.cfg.get("loss", {}).get("name", "")
 
-        # Coordinate regression losses (LOTR-style direct coordinate prediction)
         coord_regression_losses = [
-            "smooth_wing", "wing", "adaptive_wing", 
+            "smooth_wing", "wing", "adaptive_wing",
             "landmark_l1", "landmark_mse", "landmark_smooth_l1",
-            "nme", "combined_landmark"
+            "nme", "combined_landmark",
         ]
 
-        # For heatmap-based models we also track PCK/NME; for pose
-        # regression we only report the scalar loss.
-        coord_preds = []
-        coord_targets = []
+        coord_preds: list[np.ndarray] = []
+        coord_targets: list[np.ndarray] = []
         is_coord_regression = loss_name in coord_regression_losses
 
         # Optionally evaluate EMA weights.
@@ -619,19 +709,16 @@ class Trainer:
                         weights = weights.to(self.device)
 
                     loss = self.criterion(preds_2d, targets_2d, weights, sample_weight=sample_weight)
-                    preds_last = None  # no heatmaps here
+                    preds_last = None
 
                 elif is_coord_regression:
-                    # Coordinate regression validation (LOTR-style)
                     targets_2d = batch["keypoints"][:, :, :2].to(self.device)
                     visible = batch["visible"].to(self.device)
-
                     out = self.model(imgs)
 
-                    # LOTR returns (normalized_coords, pixel_coords)
                     if isinstance(out, tuple) and len(out) == 2:
                         _, landmarks_pixel = out
-                        preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                        preds_2d = landmarks_pixel[..., :2]
                     else:
                         preds_2d = out
                         if preds_2d.dim() == 2:
@@ -639,14 +726,11 @@ class Trainer:
                             preds_2d = preds_2d.view(B, -1, 2)
 
                     loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
-                    preds_last = None  # no heatmaps
+                    preds_last = None
 
-                    # Collect predictions and targets for NME computation
                     for b in range(preds_2d.size(0)):
-                        pred_coords = preds_2d[b].cpu().numpy()
-                        target_coords = targets_2d[b].cpu().numpy()
-                        coord_preds.append(pred_coords)
-                        coord_targets.append(target_coords)
+                        coord_preds.append(preds_2d[b].cpu().numpy())
+                        coord_targets.append(targets_2d[b].cpu().numpy())
 
                 else:
                     if loss_name == "heatmap_3d_mse":
@@ -675,52 +759,92 @@ class Trainer:
                         for p in preds_all:
                             loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
 
-                # Only compute PCK/NME if we actually have heatmaps
-                if preds_last is not None and preds_last.dim() == 4:
-                    # image and heatmap sizes from dataset config
-                    H_img, W_img = self.train_ds.input_size[1], self.train_ds.input_size[0]
-                    H_hm, W_hm = self.train_ds.heatmap_size[1], self.train_ds.heatmap_size[0]
+                if preds_last is not None and isinstance(preds_last, torch.Tensor) and preds_last.dim() == 4:
+                    # image and heatmap sizes from the *validation* dataset
+                    H_img, W_img = dataset.input_size[1], dataset.input_size[0]
+                    H_hm, W_hm = dataset.heatmap_size[1], dataset.heatmap_size[0]
                     sx = W_hm / float(W_img)
                     sy = H_hm / float(H_img)
 
                     for b in range(preds_last.size(0)):
-                        hm = preds_last[b].cpu()  # (K,H,W)
+                        hm = preds_last[b].cpu()
                         K, H, W = hm.shape
                         h_flat = hm.view(K, -1)
                         idx = torch.argmax(h_flat, dim=1)
                         y = (idx // W).float().numpy()
                         x = (idx % W).float().numpy()
-                        coords = np.stack([x, y], axis=1)
-                        coord_preds.append(coords)
+                        coord_preds.append(np.stack([x, y], axis=1))
 
-                        # targets: from batch['keypoints'], scaled into heatmap space
                         t = batch["keypoints"][b].cpu().numpy()[:, :2]
-                        t_hm = np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1)
-                        coord_targets.append(t_hm)
+                        coord_targets.append(np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1))
 
-                running_loss += loss.item()
-                pbar.set_postfix(loss=loss.item())
+                running_loss += float(loss.item())
+                pbar.set_postfix(loss=float(loss.item()))
 
-        val_loss = running_loss / len(self.val_loader)
-        self.log_metric("val", "loss", val_loss)
+        val_loss = running_loss / max(1, len(loader))
 
-        # If we computed keypoint coords, also log PCK/NME
+        metrics: dict[str, float] = {"loss": float(val_loss)}
         if coord_preds:
             try:
                 coord_preds_arr = np.stack(coord_preds)
                 coord_targets_arr = np.stack(coord_targets)
-                pck = compute_pck(coord_preds_arr, coord_targets_arr)
-                nme = compute_nme(coord_preds_arr, coord_targets_arr)
-                self.log_metric("val", "pck", float(pck))
-                self.log_metric("val", "nme", float(nme))
-                print(f"Val: loss={val_loss:.4f}, PCK={pck:.4f}, NME={nme:.4f}")
+                metrics["pck"] = float(compute_pck(coord_preds_arr, coord_targets_arr))
+                metrics["nme"] = float(compute_nme(coord_preds_arr, coord_targets_arr))
             except Exception:
-                print(f"Val: loss={val_loss:.4f}")
-        else:
-            # pose-reprojection case (no heatmaps)
-            print(f"Val: loss={val_loss:.4f}")
+                pass
+        return metrics
 
-        return val_loss
+    @torch.no_grad()
+    def validate_epoch(self, epoch: int):
+        # Validate each configured val dataset, then aggregate into a single scalar
+        # for checkpoint selection.
+        per_ds: dict[str, dict[str, float]] = {}
+
+        for name, loader in self.val_loaders.items():
+            ds = self.val_datasets[name]
+            per_ds[name] = self._validate_one(epoch=epoch, name=name, loader=loader, dataset=ds)
+
+            # Log per-dataset metrics with stable names (no path separators).
+            for k, v in per_ds[name].items():
+                self.log_metric("val", f"{k}_{name}", float(v))
+
+        # Aggregate loss across datasets (weighted average).
+        total_w = 0.0
+        agg_loss = 0.0
+        for name, m in per_ds.items():
+            w = float(self.val_weights.get(name, 1.0))
+            if w <= 0:
+                continue
+            total_w += w
+            agg_loss += w * float(m.get("loss", 0.0))
+
+        val_loss = agg_loss / max(1e-12, total_w)
+        self.log_metric("val", "loss", float(val_loss))
+
+        # Prefer reporting PCK/NME for the primary dataset (if present).
+        primary = per_ds.get(self.primary_val_name, {})
+        if "pck" in primary:
+            self.log_metric("val", "pck", float(primary["pck"]))
+        if "nme" in primary:
+            self.log_metric("val", "nme", float(primary["nme"]))
+
+        # Console summary
+        msg = f"Val(agg): loss={val_loss:.4f}"
+        if "pck" in primary:
+            msg += f", PCK[{self.primary_val_name}]={primary['pck']:.4f}"
+        if "nme" in primary:
+            msg += f", NME[{self.primary_val_name}]={primary['nme']:.4f}"
+        print(msg)
+        for name, m in per_ds.items():
+            extra = []
+            if "pck" in m:
+                extra.append(f"PCK={m['pck']:.4f}")
+            if "nme" in m:
+                extra.append(f"NME={m['nme']:.4f}")
+            extra_s = (", " + ", ".join(extra)) if extra else ""
+            print(f"  - val[{name}]: loss={m['loss']:.4f}{extra_s}")
+
+        return float(val_loss)
 
     def save_checkpoint(self, epoch, best=False):
         name = "best.pth" if best else f"epoch_{epoch}.pth"
@@ -858,8 +982,11 @@ class Trainer:
             self._load_checkpoint(resume_path)
 
         best_val = float("inf")
+        current_epoch = self.start_epoch  # Track current epoch for interrupt handling
+        interrupted = False
         try:
             for epoch in range(self.start_epoch, self.epochs + 1):
+                current_epoch = epoch
                 train_loss = self.train_epoch(epoch)
                 val_loss = self.validate_epoch(epoch)
                 self.scheduler.step()
@@ -874,8 +1001,18 @@ class Trainer:
                 # periodically refresh qualitative visualizations
                 self._save_qualitative_examples()
         except KeyboardInterrupt:
+            interrupted = True
             print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint and report...")
-            self.save_checkpoint(epoch, best=False)
         finally:
+            # Save checkpoint on interruption (outside of except to avoid nested exceptions)
+            if interrupted:
+                try:
+                    self.save_checkpoint(current_epoch, best=False)
+                    print(f"Saved interrupt checkpoint at epoch {current_epoch}.")
+                except Exception as e:
+                    print(f"Warning: could not save interrupt checkpoint: {e}")
             # always try to save a small report (curves + a few images)
-            self._save_training_report()
+            try:
+                self._save_training_report()
+            except Exception as e:
+                print(f"Warning: could not save training report: {e}")

@@ -18,10 +18,21 @@ data:
       image_root: "datasets/300W-xreal_air2"
       loss_weight: 0.3
 
-  # Validation is currently a single dataset.
-  # Pick whichever distribution you care about most for checkpoint selection.
-  val_json: "datasets/hmd_xreal/annotations/val.json"
-  val_image_root: "datasets/hmd_xreal/images"
+  # Multi-dataset validation.
+  # - Trainer evaluates each val set and logs metrics as val/<metric>_<name>.
+  # - A weighted aggregate loss Val(agg) is used for checkpoint selection.
+  # - primary_val controls which val set is also logged as val/pck and val/nme.
+  primary_val: hmd_xreal
+  val_datasets:
+    - name: hmd_xreal
+      val_json: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+    - name: 300w_xreal_air2
+      val_json: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 1.0
 
   input_size: [256, 256]
   heatmap_size: [64, 64]
