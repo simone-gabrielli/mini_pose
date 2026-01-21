@@ -19,8 +19,13 @@ import cv2
 import numpy as np
 import torch
 
-from pose.engine.inference import decode_heatmaps, load_model
+from pose.engine.inference import decode_heatmaps, load_model as load_heatmap_model
 from pose.detectors.haar_face import HaarFaceDetector
+from pose.config import Config
+from pose.registry import MODEL_REGISTRY
+
+# Ensure model modules are imported so they register themselves in MODEL_REGISTRY
+import pose.models  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,12 @@ def _infer_landmarks_on_crop(
     """
 
     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+
+    # IMPORTANT: `input_size` here should match the preprocessing size used
+    # during training. For LOTRLight, training commonly uses data.input_size=192
+    # while the model may have been instantiated with its default input_size=256
+    # (affecting positional encoding buffers). In that case the checkpoint can
+    # still work, but the learned coordinate scale matches the training resize.
     W_face, H_face = input_size
     face_rgb = cv2.resize(face_rgb, (W_face, H_face), interpolation=cv2.INTER_LINEAR)
 
@@ -106,20 +117,75 @@ def _infer_landmarks_on_crop(
     img = img.transpose(2, 0, 1)
     img_t = torch.from_numpy(img).float().unsqueeze(0).to(device)
 
-    def _extract_preds_last(model_out: object) -> torch.Tensor:
-        # Match Trainer._visualize_model_outputs selection logic
+    def _extract_landmarks_px(model_out: object) -> Optional[np.ndarray]:
+        """Extract direct landmark pixel coordinates for LOTR-style models.
+
+        Supported outputs:
+        - Tuple(norm_coords, pixel_coords) where pixel_coords is (B, N, 2/3)
+        - Tensor (B, N, 2/3) or (B, N*2)
+        - Dict with key 'landmarks_pixel'
+        """
+
+        if isinstance(model_out, dict):
+            lm = model_out.get("landmarks_pixel")
+            if isinstance(lm, torch.Tensor):
+                model_out = lm
+
+        # LOTR returns (normalized_coords, pixel_coords)
+        if isinstance(model_out, tuple) and len(model_out) == 2:
+            a, b = model_out
+            if isinstance(b, torch.Tensor) and b.dim() == 3 and b.shape[-1] in (2, 3):
+                coords = b[0].detach().cpu().numpy()
+                return coords[:, :2]
+
+        if isinstance(model_out, torch.Tensor):
+            t = model_out
+            if t.dim() == 3 and t.shape[-1] in (2, 3):
+                coords = t[0].detach().cpu().numpy()
+                return coords[:, :2]
+            if t.dim() == 2:
+                # (B, N*2) flattened coords
+                flat = t[0]
+                if flat.numel() == num_keypoints * 2:
+                    coords = flat.view(num_keypoints, 2).detach().cpu().numpy()
+                    return coords
+
+        return None
+
+    def _extract_heatmaps_last(model_out: object) -> torch.Tensor:
+        # Match Trainer._visualize_model_outputs selection logic for heatmap models.
         if isinstance(model_out, tuple):
+            # If tuple[0] is a tensor and looks like heatmaps, use it.
             if len(model_out) >= 1 and isinstance(model_out[0], torch.Tensor):
                 return model_out[0]
-            if len(model_out) >= 2 and isinstance(model_out[1], (list, tuple)):
-                return model_out[1][-1]
+            # Some models return (preds_last, preds_all) where preds_all is list/tuple
+            if len(model_out) >= 2 and isinstance(model_out[1], (list, tuple)) and model_out[1]:
+                last = model_out[1][-1]
+                if isinstance(last, torch.Tensor):
+                    return last
         if isinstance(model_out, torch.Tensor):
             return model_out
-        raise TypeError(f"Unsupported model output type for heatmaps: {type(model_out)}")
+        if isinstance(model_out, dict) and "heatmaps" in model_out and isinstance(model_out["heatmaps"], torch.Tensor):
+            return model_out["heatmaps"]
+        raise TypeError(f"Unsupported model output type: {type(model_out)}")
 
     with torch.no_grad():
         out = model(img_t)
-        preds_last = _extract_preds_last(out)
+
+        # Prefer direct coordinate outputs (LOTR) when available.
+        coords_px = _extract_landmarks_px(out)
+        if coords_px is not None:
+            # For coordinate-regression models, there's no heatmap resolution.
+            # Return the pixel frame size that `coords_px` is expressed in.
+            return coords_px, (H_face, W_face)
+
+        preds_last = _extract_heatmaps_last(out)
+
+        # Heatmaps are (B, K, Hh, Wh)
+        if preds_last.dim() != 4:
+            raise RuntimeError(
+                f"Expected heatmap tensor (B,K,H,W) but got shape {tuple(preds_last.shape)} from {type(model).__name__}"
+            )
         heatmaps = preds_last[0].detach().cpu()  # (K,Hh,Wh)
 
     coords_hm = decode_heatmaps(heatmaps)  # (K,2) in heatmap space
@@ -131,6 +197,122 @@ def _infer_landmarks_on_crop(
     coords_px[:, 1] *= (H_face / float(H_hm))
 
     return coords_px, (H_hm, W_hm)
+
+
+def _load_model_from_config(
+    *,
+    config_path: str,
+    checkpoint_path: str,
+    device: torch.device,
+    fallback_num_keypoints: int,
+    weights_only: bool,
+    strict: bool,
+    ema_mode: str,
+):
+    cfg = Config.from_yaml(config_path).raw
+    model_cfg = cfg.get("model", {})
+    if not model_cfg or "name" not in model_cfg:
+        raise ValueError(f"Config {config_path} missing model.name")
+
+    model_name = str(model_cfg["name"])
+    try:
+        ModelCls = MODEL_REGISTRY[model_name]
+    except KeyError:
+        available = ", ".join(sorted(MODEL_REGISTRY.keys()))
+        raise KeyError(f"Model '{model_name}' not found in MODEL_REGISTRY. Available models: {available}")
+
+    data_cfg = cfg.get("data", {})
+    num_keypoints = int(data_cfg.get("num_keypoints", fallback_num_keypoints))
+
+    model_kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
+    model_kwargs["num_keypoints"] = num_keypoints
+    if "input_size" in data_cfg:
+        model_kwargs["input_size"] = tuple(data_cfg["input_size"])
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=weights_only)
+    state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    def _infer_input_size_from_pe() -> Optional[Tuple[int, int]]:
+        pe = state_dict.get("pos_encoding.pe")
+        if not isinstance(pe, torch.Tensor) or pe.dim() != 3:
+            return None
+        pe_h, pe_w = int(pe.shape[0]), int(pe.shape[1])
+
+        use_upsampling = bool(model_kwargs.get("use_upsampling", True))
+        up_layers = int(model_kwargs.get("upsampling_layers", 2)) if use_upsampling else 0
+        scale = 2 ** max(0, up_layers)
+        # LOTR feature map starts at stride 32, then optional upsampling.
+        # pe_h = input_h / 32 * scale  => input_h = pe_h * 32 / scale
+        input_h = int(round(pe_h * 32 / float(scale)))
+        input_w = int(round(pe_w * 32 / float(scale)))
+        if input_h <= 0 or input_w <= 0:
+            return None
+        return (input_h, input_w)
+
+    def _build_model(overrides: Optional[dict] = None):
+        kw = dict(model_kwargs)
+        if overrides:
+            kw.update(overrides)
+        return ModelCls(**kw)
+
+    model = _build_model()
+
+    try:
+        model.load_state_dict(state_dict, strict=bool(strict))
+    except RuntimeError as e:
+        # Common case: LOTR positional encoding buffer size mismatch because the
+        # config input_size doesn't match the checkpoint's training input.
+        inferred = _infer_input_size_from_pe()
+        if inferred is not None:
+            try:
+                model = _build_model({"input_size": inferred})
+                model.load_state_dict(state_dict, strict=bool(strict))
+            except RuntimeError:
+                # Fall through to drop PE
+                model = _build_model({"input_size": inferred})
+                sd = dict(state_dict)
+                sd.pop("pos_encoding.pe", None)
+                model.load_state_dict(sd, strict=False)
+        else:
+            # As a last resort: drop the positional encoding tensor and load non-strict.
+            sd = dict(state_dict)
+            if "pos_encoding.pe" in sd:
+                sd.pop("pos_encoding.pe", None)
+                model.load_state_dict(sd, strict=False)
+            else:
+                raise e
+
+    # Optional: apply EMA weights (common for 'best.pth' checkpoints)
+    # Trainer saves EMA state under ckpt['ema']['shadow'] and (optionally) evaluates using EMA.
+    ema_shadow = None
+    if isinstance(ckpt, dict):
+        ema_state = ckpt.get("ema")
+        if isinstance(ema_state, dict):
+            shadow = ema_state.get("shadow")
+            if isinstance(shadow, dict):
+                ema_shadow = shadow
+
+    def _should_use_ema() -> bool:
+        mode = str(ema_mode).lower().strip() if ema_mode is not None else "auto"
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        # auto: follow config if present, else use EMA when available
+        ema_cfg = (cfg.get("train", {}) or {}).get("ema", {}) or {}
+        return bool(ema_cfg.get("eval", True))
+
+    if ema_shadow is not None and _should_use_ema():
+        missing, unexpected = model.load_state_dict(ema_shadow, strict=False)
+        if missing or unexpected:
+            # Don't fail inference; just warn.
+            print(f"[WARN] EMA load had missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            print("Using EMA weights for inference")
+
+    model.to(device)
+    model.eval()
+    return model, cfg, num_keypoints
 
 
 def _draw_keypoints(img_bgr: np.ndarray, kpts: np.ndarray, color_bgr: Tuple[int, int, int], radius: int) -> None:
@@ -217,6 +399,11 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-name", default="stacked_hourglass")
     parser.add_argument("--num-keypoints", type=int, default=68)
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Optional YAML config (recommended/required for LOTR). If set, model-name/num-keypoints/input-size default from config.",
+    )
     parser.add_argument("--device", default="cuda")
 
     src = parser.add_mutually_exclusive_group(required=True)
@@ -235,29 +422,106 @@ def main():
 
     # Default to the training config used by xreal_mobilenet (configs/xreal_mobilenet.yaml)
     parser.add_argument("--input-size", type=int, default=256, help="Model input size (square)")
+    parser.add_argument(
+        "--override-input-size",
+        action="store_true",
+        help="In --config mode, force using --input-size instead of cfg.data.input_size for preprocessing.",
+    )
     parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around bbox/face detector box")
     parser.add_argument(
         "--use-detector-if-no-bbox",
         action="store_true",
         help="If COCO annotation has no bbox, try Haar face detector",
     )
+    parser.add_argument(
+        "--force-detector",
+        action="store_true",
+        help="Ignore COCO bbox even if present; always use Haar detector crop.",
+    )
+    parser.add_argument(
+        "--force-full-image",
+        action="store_true",
+        help="Disable cropping; run model on the full image resized to input size.",
+    )
     parser.add_argument("--draw-bbox", action="store_true", help="Draw the crop bbox used for inference")
     parser.add_argument("--no-draw-gt", action="store_true", help="Do not draw ground-truth keypoints")
     parser.add_argument("--no-draw-pred", action="store_true", help="Do not draw predicted keypoints")
+    parser.add_argument(
+        "--report-gt-error",
+        action="store_true",
+        help="If GT is available (COCO mode), print mean dx/dy and mean pixel error for visible keypoints.",
+    )
+    parser.add_argument(
+        "--report-gt-debug",
+        action="store_true",
+        help="With --report-gt-error, also print crop box and pred/GT coord ranges (for debugging offsets).",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Use strict checkpoint loading (only applies when --config is set).",
+    )
+    parser.add_argument(
+        "--ema",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="EMA weights usage when checkpoint contains EMA state (auto follows config train.ema.eval).",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    model = load_model(
-        args.checkpoint,
-        model_name=args.model_name,
-        num_keypoints=args.num_keypoints,
-        device=device,
-        weights_only=True,
-    )
+    weights_only = True
+    cfg = None
+    if args.config:
+        model, cfg, cfg_num_keypoints = _load_model_from_config(
+            config_path=str(args.config),
+            checkpoint_path=str(args.checkpoint),
+            device=device,
+            fallback_num_keypoints=int(args.num_keypoints),
+            weights_only=weights_only,
+            strict=bool(args.strict),
+            ema_mode=str(args.ema),
+        )
+        num_keypoints = int(cfg_num_keypoints)
+        # In config mode, prefer preprocessing size from cfg.data.input_size unless overridden.
+    else:
+        model = load_heatmap_model(
+            args.checkpoint,
+            model_name=args.model_name,
+            num_keypoints=args.num_keypoints,
+            device=device,
+            weights_only=weights_only,
+        )
+        num_keypoints = int(args.num_keypoints)
+
+    if hasattr(model, "input_size"):
+        try:
+            print(f"Loaded model: {type(model).__name__} model.input_size={getattr(model, 'input_size')}")
+        except Exception:
+            print(f"Loaded model: {type(model).__name__} (input_size unreadable)")
+    else:
+        print(f"Loaded model: {type(model).__name__} (no model.input_size)")
+
+    if int(args.input_size) < 32 and not args.config:
+        print(
+            f"[WARN] Very small --input-size={args.input_size}. "
+            "If this was meant to be 192/256, it will cause large scale errors."
+        )
 
     _safe_mkdir(args.out_dir)
-    input_size = (int(args.input_size), int(args.input_size))
+
+    # Choose preprocessing input size (W,H)
+    if args.config and cfg is not None and not args.override_input_size:
+        data_cfg = (cfg or {}).get("data", {})
+        if isinstance(data_cfg, dict) and "input_size" in data_cfg and len(data_cfg["input_size"]) == 2:
+            w = int(data_cfg["input_size"][0])
+            h = int(data_cfg["input_size"][1])
+            input_size = (w, h)
+        else:
+            input_size = (int(args.input_size), int(args.input_size))
+    else:
+        input_size = (int(args.input_size), int(args.input_size))
     detector = HaarFaceDetector()
 
     def process_one(
@@ -274,7 +538,11 @@ def main():
 
         H_orig, W_orig = img_bgr.shape[:2]
         crop_xyxy = None
-        if bbox_xywh is not None:
+        if args.force_full_image:
+            crop_xyxy = (0, 0, W_orig, H_orig)
+        elif args.force_detector:
+            crop_xyxy = _detect_face_crop_xyxy(detector, img_bgr, margin=float(args.face_margin))
+        elif bbox_xywh is not None:
             crop_xyxy = _expand_bbox_xywh(bbox_xywh, margin=float(args.face_margin), img_w=W_orig, img_h=H_orig)
         elif args.use_detector_if_no_bbox:
             crop_xyxy = _detect_face_crop_xyxy(detector, img_bgr, margin=float(args.face_margin))
@@ -290,22 +558,48 @@ def main():
         x1, y1, x2, y2 = crop_xyxy
         face_bgr = _crop_from_xyxy(img_bgr, x1, y1, x2, y2)
 
-        pred_px, _ = _infer_landmarks_on_crop(
+        pred_px, pred_space = _infer_landmarks_on_crop(
             model,
             device=device,
             face_bgr=face_bgr,
-            num_keypoints=int(args.num_keypoints),
+            num_keypoints=int(num_keypoints),
             input_size=input_size,
         )
 
         # map from resized crop coords -> original image coords
-        W_face, H_face = input_size
+        # pred_px is expressed in the pixel space returned by _infer_landmarks_on_crop
+        # (for LOTR: model.input_size; for heatmaps: resized crop size).
+        H_pred, W_pred = pred_space
+        W_face, H_face = int(W_pred), int(H_pred)
         scale_x = (x2 - x1) / float(W_face)
         scale_y = (y2 - y1) / float(H_face)
         pred_orig = pred_px.copy()
         pred_orig[:, 0] = pred_orig[:, 0] * scale_x + x1
         pred_orig[:, 1] = pred_orig[:, 1] * scale_y + y1
         pred_kpts = np.concatenate([pred_orig, np.ones((pred_orig.shape[0], 1), dtype=np.float32)], axis=1)
+
+        if args.report_gt_error and gt_kpts is not None:
+            # Compute error only on visible GT points.
+            vis = gt_kpts[:, 2] > 0
+            if bool(vis.any()):
+                diffs = pred_kpts[vis, :2] - gt_kpts[vis, :2]
+                dxy = diffs.mean(axis=0)
+                d = np.linalg.norm(diffs, axis=1)
+                msg = (
+                    f"{Path(img_path).name}: mean_dx={float(dxy[0]):.2f} mean_dy={float(dxy[1]):.2f} "
+                    f"mean_err_px={float(d.mean()):.2f} n_vis={int(vis.sum())}"
+                )
+                if args.report_gt_debug:
+                    pxy = pred_kpts[vis, :2]
+                    gxy = gt_kpts[vis, :2]
+                    msg += (
+                        f" crop=({x1},{y1},{x2},{y2}) "
+                        f"pred_x=({float(pxy[:,0].min()):.1f},{float(pxy[:,0].max()):.1f}) "
+                        f"pred_y=({float(pxy[:,1].min()):.1f},{float(pxy[:,1].max()):.1f}) "
+                        f"gt_x=({float(gxy[:,0].min()):.1f},{float(gxy[:,0].max()):.1f}) "
+                        f"gt_y=({float(gxy[:,1].min()):.1f},{float(gxy[:,1].max()):.1f})"
+                    )
+                print(msg)
 
         viz = img_bgr.copy()
         if not args.no_draw_gt and gt_kpts is not None:
