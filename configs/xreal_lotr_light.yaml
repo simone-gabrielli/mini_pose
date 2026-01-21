@@ -6,26 +6,36 @@ seed: 42
 
 data:
   type: coco_keypoints
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/train.json"
-  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
+  # Mix multiple COCO-style datasets for training.
+  # Each entry contributes samples to the same training loader.
+  # loss_weight scales the contribution of that dataset to the loss.
+  train_datasets:
+    - name: hmd_xreal
+      train_json: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      loss_weight: 1.0
 
-  # Multi-dataset validation.
-  # Keep air2 as primary (matches previous single-val behavior), but also report metrics on hmd_xreal.
-  primary_val: 300w_xreal_air2
-  val_datasets:
     - name: 300w_xreal_air2
-      val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/val.json"
-      image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
-      weight: 1.0
-
+      train_json: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      loss_weight: 0.4
+  # Multi-dataset validation.
+  primary_val: hmd_xreal
+  val_datasets:
     - name: hmd_xreal
       val_json: "datasets/hmd_xreal/annotations/val.json"
       image_root: "datasets/hmd_xreal/images"
       weight: 1.0
+
+    - name: 300w_xreal_air2
+      val_json: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.2
+
   input_size: [192, 192]      # Smaller input for speed
   heatmap_size: [48, 48]
-  batch_size: 64              # Larger batch size due to smaller model
-  num_workers: 0
+  batch_size: 16              # Larger batch size due to smaller model
+  num_workers: 4
   aug:
     use_bbox_crop: true
     face_margin: 0.5
@@ -96,22 +106,22 @@ loss:
   t: 2.0
 
 train:
-  epochs: 100
+  epochs: 200
   lr: 0.0002
   weight_decay: 0.0001
   optimizer: adam
-  lr_schedule: multistep
-  lr_steps: [60, 80]
+  lr_schedule: cosine
+  lr_steps: [60, 75]
   lr_gamma: 0.1
   warmup_epochs: 5
   warmup_start_factor: 0.1
   min_lr: 0.0
   grad_clip_norm: 0.0
   amp:
-    enabled: false
+    enabled: true
     dtype: fp16
   ema:
-    enabled: false
+    enabled: true
     decay: 0.999
     update_every: 1
     eval: true
