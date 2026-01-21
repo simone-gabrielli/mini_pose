@@ -10,17 +10,24 @@ Examples:
 python scripts/infer_video.py --checkpoint work_dirs/xreal_fan2d/best.pth --input-video input.mp4 --fp16
 """
 import argparse
+import math
 import os
 import time
 import signal
 from time import perf_counter
 from typing import Tuple
+import xml.etree.ElementTree as ET
 
 import cv2
 import torch
 import numpy as np
 
-from pose.engine.inference import load_model, decode_heatmaps
+from pose.engine.inference import load_model as load_heatmap_model, decode_heatmaps
+from pose.config import Config
+from pose.registry import MODEL_REGISTRY
+
+# Ensure model modules are imported so they register themselves in MODEL_REGISTRY
+import pose.models  # noqa: F401
 
 
 def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int, int] = (0, 0, 255)):
@@ -28,15 +35,232 @@ def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int,
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
 
 
-def _preprocess_rgb_to_tensor(img_rgb: np.ndarray, input_size: int) -> torch.Tensor:
+def _load_3d_landmarks_xml(xml_path: str) -> np.ndarray:
+    """Load 3D landmarks from the provided XML format.
+
+    Expected structure:
+      <model><landmarks><landmark id="0" x="..." y="..." z="..." /> ...
+
+    Returns:
+      (N,3) float32 array ordered by increasing landmark id.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    lms = root.find("landmarks")
+    if lms is None:
+        # allow nesting: <model><landmarks>...
+        lms = root.find("./model/landmarks")
+    if lms is None:
+        raise ValueError(f"No <landmarks> node found in XML: {xml_path}")
+
+    items: list[tuple[int, float, float, float]] = []
+    for el in lms.findall("landmark"):
+        try:
+            idx = int(el.attrib["id"])
+            x = float(el.attrib["x"])
+            y = float(el.attrib["y"])
+            z = float(el.attrib["z"])
+        except Exception:
+            continue
+        items.append((idx, x, y, z))
+
+    if not items:
+        raise ValueError(f"No <landmark .../> entries found in XML: {xml_path}")
+
+    items.sort(key=lambda t: t[0])
+    pts = np.array([[x, y, z] for (_, x, y, z) in items], dtype=np.float32)
+    return pts
+
+
+def _camera_matrix_from_args(W: int, H: int, args) -> np.ndarray:
+    cx = float(args.cam_cx) if args.cam_cx is not None else (W / 2.0)
+    cy = float(args.cam_cy) if args.cam_cy is not None else (H / 2.0)
+
+    fx = args.cam_fx
+    fy = args.cam_fy
+    if args.cam_fov_deg is not None and (fx is None or fy is None):
+        fov = float(args.cam_fov_deg)
+        # assume horizontal FOV
+        fx_est = (W / 2.0) / max(1e-9, math.tan(math.radians(fov) / 2.0))
+        fx = fx if fx is not None else fx_est
+        fy = fy if fy is not None else fx_est
+
+    if fx is None:
+        fx = float(max(W, H))
+    if fy is None:
+        fy = float(max(W, H))
+
+    K = np.array(
+        [
+            [float(fx), 0.0, float(cx)],
+            [0.0, float(fy), float(cy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return K
+
+
+def _solve_pnp(
+    obj_pts_3d: np.ndarray,
+    img_pts_2d: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    method: str,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if obj_pts_3d is None or img_pts_2d is None:
+        return None
+    n = min(int(obj_pts_3d.shape[0]), int(img_pts_2d.shape[0]))
+    if n < 4:
+        return None
+
+    obj = obj_pts_3d[:n].astype(np.float64).reshape(-1, 1, 3)
+    img = img_pts_2d[:n].astype(np.float64).reshape(-1, 1, 2)
+
+    flag_map = {
+        "iterative": cv2.SOLVEPNP_ITERATIVE,
+        "epnp": cv2.SOLVEPNP_EPNP,
+        "p3p": cv2.SOLVEPNP_P3P,
+        "ap3p": cv2.SOLVEPNP_AP3P,
+    }
+    flags = flag_map.get(str(method).lower(), cv2.SOLVEPNP_ITERATIVE)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=flags)
+    except Exception:
+        return None
+    if not ok:
+        return None
+    return rvec, tvec
+
+
+def _project_points(obj_pts_3d: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    obj = obj_pts_3d.astype(np.float64).reshape(-1, 1, 3)
+    proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+    return proj.reshape(-1, 2).astype(np.float32)
+
+
+def _tile_same_size(images: list[np.ndarray], cols: int = 4, pad: int = 6, bg: Tuple[int, int, int] = (16, 16, 16)) -> np.ndarray:
+    """Tile images (all same HxW) into a grid."""
+    if not images:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    cols = max(1, int(cols))
+    pad = max(0, int(pad))
+    h, w = images[0].shape[:2]
+    rows = int(np.ceil(len(images) / float(cols)))
+
+    out_h = rows * h + (rows + 1) * pad
+    out_w = cols * w + (cols + 1) * pad
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    canvas[:, :] = np.array(bg, dtype=np.uint8)
+
+    for idx, im in enumerate(images):
+        r = idx // cols
+        c = idx % cols
+        y = pad + r * (h + pad)
+        x = pad + c * (w + pad)
+        canvas[y : y + h, x : x + w] = im
+    return canvas
+
+
+def _preprocess_rgb_to_tensor(img_rgb: np.ndarray, input_size: Tuple[int, int]) -> torch.Tensor:
     """Match training pipeline normalization (ImageNet mean/std) and resize."""
-    img_rgb = cv2.resize(img_rgb, (int(input_size), int(input_size)), interpolation=cv2.INTER_LINEAR)
+    w, h = int(input_size[0]), int(input_size[1])
+    img_rgb = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
     img = img_rgb.astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     img = (img - mean) / std
     img = img.transpose(2, 0, 1)
     return torch.from_numpy(img).float()
+
+
+def _load_model_from_config(
+    *,
+    config_path: str,
+    checkpoint_path: str,
+    device: torch.device,
+    fallback_num_keypoints: int,
+    weights_only: bool,
+    strict: bool,
+):
+    """Load a model using the same generic config wiring as Trainer.
+
+    Also handles LOTR positional encoding size mismatches by rebuilding the model
+    with an inferred input_size (from checkpoint pos_encoding.pe) if needed.
+
+    Returns: (model, cfg_raw, num_keypoints)
+    """
+
+    cfg = Config.from_yaml(config_path).raw
+    model_cfg = cfg.get("model", {})
+    if not model_cfg or "name" not in model_cfg:
+        raise ValueError(f"Config {config_path} missing model.name")
+
+    model_name = str(model_cfg["name"])
+    try:
+        ModelCls = MODEL_REGISTRY[model_name]
+    except KeyError:
+        available = ", ".join(sorted(MODEL_REGISTRY.keys()))
+        raise KeyError(f"Model '{model_name}' not found in MODEL_REGISTRY. Available models: {available}")
+
+    data_cfg = cfg.get("data", {})
+    num_keypoints = int(data_cfg.get("num_keypoints", fallback_num_keypoints))
+
+    model_kwargs = {k: v for k, v in model_cfg.items() if k != "name"}
+    model_kwargs["num_keypoints"] = num_keypoints
+    if "input_size" in data_cfg:
+        model_kwargs["input_size"] = tuple(data_cfg["input_size"])
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=weights_only)
+    state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    def _infer_input_size_from_pe() -> Tuple[int, int] | None:
+        pe = state_dict.get("pos_encoding.pe")
+        if not isinstance(pe, torch.Tensor) or pe.dim() != 3:
+            return None
+        pe_h, pe_w = int(pe.shape[0]), int(pe.shape[1])
+
+        use_upsampling = bool(model_kwargs.get("use_upsampling", True))
+        up_layers = int(model_kwargs.get("upsampling_layers", 2)) if use_upsampling else 0
+        scale = 2 ** max(0, up_layers)
+        input_h = int(round(pe_h * 32 / float(scale)))
+        input_w = int(round(pe_w * 32 / float(scale)))
+        if input_h <= 0 or input_w <= 0:
+            return None
+        return (input_h, input_w)
+
+    def _build_model(overrides: dict | None = None):
+        kw = dict(model_kwargs)
+        if overrides:
+            kw.update(overrides)
+        return ModelCls(**kw)
+
+    model = _build_model()
+    try:
+        model.load_state_dict(state_dict, strict=bool(strict))
+    except RuntimeError as e:
+        inferred = _infer_input_size_from_pe()
+        if inferred is not None:
+            try:
+                model = _build_model({"input_size": inferred})
+                model.load_state_dict(state_dict, strict=bool(strict))
+            except RuntimeError:
+                # Last resort: drop positional encoding buffer
+                model = _build_model({"input_size": inferred})
+                sd = dict(state_dict)
+                sd.pop("pos_encoding.pe", None)
+                model.load_state_dict(sd, strict=False)
+        else:
+            sd = dict(state_dict)
+            if "pos_encoding.pe" in sd:
+                sd.pop("pos_encoding.pe", None)
+                model.load_state_dict(sd, strict=False)
+            else:
+                raise e
+
+    model.to(device)
+    model.eval()
+    return model, cfg, num_keypoints
 
 
 def _extract_preds_last(model_out: object) -> torch.Tensor:
@@ -280,6 +504,21 @@ def main():
     parser.add_argument("--num-keypoints", type=int, default=68)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--input-size", type=int, default=256)
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Optional YAML config (recommended for LOTR). If set, preprocessing size defaults to cfg.data.input_size.",
+    )
+    parser.add_argument(
+        "--override-input-size",
+        action="store_true",
+        help="In --config mode, force using --input-size instead of cfg.data.input_size for preprocessing.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Use strict checkpoint loading (only applies when --config is set).",
+    )
     parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around detected face box (training default)")
 
     # If your input video is built from a COCO dataset (frames are the dataset images
@@ -295,9 +534,26 @@ def main():
     parser.add_argument("--max-faces", type=int, default=4)
     parser.add_argument("--skip-frames", type=int, default=1)
     parser.add_argument("--draw-face-box", action="store_true")
+    parser.add_argument("--draw-crop-box", action="store_true", help="Draw the square crop box actually used for inference")
     # Default to 0 because training bbox-crop doesn't add arbitrary padding.
     parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
     parser.add_argument("--display", action="store_true", help="Show real-time preview window")
+    parser.add_argument(
+        "--show-input-crops",
+        action="store_true",
+        help="Show a debug window with the per-face 256x256 model inputs and landmarks overlaid",
+    )
+    parser.add_argument("--debug-crops-cols", type=int, default=4, help="Columns for the debug crops tiling window")
+    parser.add_argument("--model-3d-xml", default=None, help="Optional 3D landmark template XML; enables PnP + projection overlay")
+    parser.add_argument("--draw-pnp", action="store_true", help="Draw reprojected 3D landmarks (from solvePnP) over the frame")
+    parser.add_argument("--draw-axes", action="store_true", help="Draw pose axes (requires --model-3d-xml)")
+    parser.add_argument("--axes-len", type=float, default=0.05, help="Axes length in 3D units (same units as XML)")
+    parser.add_argument("--pnp-method", choices=["iterative", "epnp", "p3p", "ap3p"], default="iterative")
+    parser.add_argument("--cam-fx", type=float, default=None, help="Camera fx in pixels (default: derived)")
+    parser.add_argument("--cam-fy", type=float, default=None, help="Camera fy in pixels (default: derived)")
+    parser.add_argument("--cam-cx", type=float, default=None, help="Camera cx in pixels (default: W/2)")
+    parser.add_argument("--cam-cy", type=float, default=None, help="Camera cy in pixels (default: H/2)")
+    parser.add_argument("--cam-fov-deg", type=float, default=None, help="Optional horizontal FOV in degrees (used to estimate fx/fy)")
     parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
     parser.add_argument(
         "--detect-every",
@@ -336,15 +592,41 @@ def main():
         except Exception:
             pass
 
-    model = load_model(args.checkpoint, model_name=args.model_name, num_keypoints=args.num_keypoints, device=device)
-    # Ensure coordinate-regression models (e.g., LOTR) scale outputs to the same
-    # crop size we use in this script.
-    if hasattr(model, "input_size"):
-        try:
-            model.input_size = (int(args.input_size), int(args.input_size))
-        except Exception:
-            pass
-    model.eval()
+    weights_only = True
+    cfg = None
+    if args.config:
+        model, cfg, cfg_num_keypoints = _load_model_from_config(
+            config_path=str(args.config),
+            checkpoint_path=str(args.checkpoint),
+            device=device,
+            fallback_num_keypoints=int(args.num_keypoints),
+            weights_only=weights_only,
+            strict=bool(args.strict),
+        )
+        args.num_keypoints = int(cfg_num_keypoints)
+    else:
+        model = load_heatmap_model(args.checkpoint, model_name=args.model_name, num_keypoints=args.num_keypoints, device=device)
+
+    # Choose preprocessing input size (W,H). In config mode, prefer cfg.data.input_size
+    # unless user forces --override-input-size.
+    if args.config and cfg is not None and not args.override_input_size:
+        data_cfg = (cfg or {}).get("data", {})
+        if isinstance(data_cfg, dict) and "input_size" in data_cfg and len(data_cfg["input_size"]) == 2:
+            preprocess_size = (int(data_cfg["input_size"][0]), int(data_cfg["input_size"][1]))
+        else:
+            preprocess_size = (int(args.input_size), int(args.input_size))
+    else:
+        preprocess_size = (int(args.input_size), int(args.input_size))
+
+    if int(preprocess_size[0]) < 32 or int(preprocess_size[1]) < 32:
+        print(f"[WARN] Very small preprocessing size {preprocess_size}. Did you mean e.g. 192 or 256?")
+
+    try:
+        print(f"Loaded model: {type(model).__name__} | preprocess_size={preprocess_size}")
+        if hasattr(model, "input_size"):
+            print(f"Model input_size attribute: {getattr(model, 'input_size')}")
+    except Exception:
+        pass
     try:
         p0 = next(model.parameters())
         print(f"Model parameter device: {p0.device}")
@@ -367,6 +649,14 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    obj_pts_3d = None
+    if args.model_3d_xml:
+        obj_pts_3d = _load_3d_landmarks_xml(args.model_3d_xml)
+        print(f"Loaded 3D template points: {obj_pts_3d.shape[0]} from {args.model_3d_xml}")
+
+    K_cam = _camera_matrix_from_args(W, H, args)
+    dist = np.zeros((4, 1), dtype=np.float64)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
@@ -398,6 +688,13 @@ def main():
     # keypoint caching
     last_kpts = []  # list[np.ndarray] in full-frame coords
     last_kpts_frame = -10**9
+
+    # PnP caching (aligned with last_kpts)
+    last_pnp = []  # list[dict] with rvec,tvec,proj
+    last_pnp_frame = -10**9
+
+    # debug crop caching
+    last_debug_tile = None
 
     # profiling accumulators (seconds)
     prof = {
@@ -517,6 +814,7 @@ def main():
                 t0 = perf_counter() if args.profile else None
                 faces = []
                 boxes_clamped = []
+                face_inputs_bgr = []  # resized (stretched) model inputs, BGR
                 for box in boxes[: args.max_faces]:
                     x, y, w, h = box
                     margin = float(args.face_margin)
@@ -531,17 +829,25 @@ def main():
 
                     x1 = max(0, x1)
                     y1 = max(0, y1)
-                    x2 = min(W - 1, x2)
-                    y2 = min(H - 1, y2)
+                    # x2/y2 are treated as EXCLUSIVE (Python slicing semantics)
+                    x2 = min(W, x2)
+                    y2 = min(H, y2)
 
                     face_bgr = frame_bgr[y1:y2, x1:x2]
                     if face_bgr.size == 0:
                         continue
 
+                    if args.draw_crop_box:
+                        cv2.rectangle(frame_bgr, (x1, y1), (max(x1, x2 - 1), max(y1, y2 - 1)), (255, 0, 0), 1)
+
                     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-                    img_t = _preprocess_rgb_to_tensor(face_rgb, input_size=args.input_size)
+                    img_t = _preprocess_rgb_to_tensor(face_rgb, input_size=preprocess_size)
                     faces.append(img_t)
                     boxes_clamped.append((x1, y1, x2, y2))
+
+                    if args.show_input_crops:
+                        face_in = cv2.resize(face_bgr, (int(preprocess_size[0]), int(preprocess_size[1])), interpolation=cv2.INTER_LINEAR)
+                        face_inputs_bgr.append(face_in)
 
                 if args.profile:
                     prof["preprocess"] += perf_counter() - t0
@@ -580,10 +886,16 @@ def main():
 
                         t1 = perf_counter() if args.profile else None
                         kpts_out = []
-                        W_face = float(args.input_size)
-                        H_face = float(args.input_size)
+                        W_face = float(preprocess_size[0])
+                        H_face = float(preprocess_size[1])
+                        debug_inputs = []
                         for i in range(coords_batch.shape[0]):
                             coords = coords_batch[i]
+                            if args.show_input_crops and i < len(face_inputs_bgr):
+                                dbg = face_inputs_bgr[i].copy()
+                                draw_landmarks(dbg, coords, color=(0, 0, 255))
+                                cv2.putText(dbg, f"face {i}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                debug_inputs.append(dbg)
                             x1, y1, x2, y2 = boxes_clamped[i]
                             scale_x = (x2 - x1) / W_face
                             scale_y = (y2 - y1) / H_face
@@ -591,8 +903,24 @@ def main():
                             coords[:, 1] = coords[:, 1] * scale_y + y1
                             kpts_out.append(coords)
 
+                        if args.show_input_crops and debug_inputs:
+                            last_debug_tile = _tile_same_size(debug_inputs, cols=args.debug_crops_cols)
+
                         last_kpts = kpts_out
                         last_kpts_frame = processed
+
+                        if obj_pts_3d is not None:
+                            pnp_out = []
+                            for i in range(len(kpts_out)):
+                                sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
+                                if sol is None:
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None})
+                                    continue
+                                rvec, tvec = sol
+                                proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
+                                pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj})
+                            last_pnp = pnp_out
+                            last_pnp_frame = processed
                         if args.profile:
                             prof["decode_draw"] += perf_counter() - t1
 
@@ -605,15 +933,22 @@ def main():
 
                         t1 = perf_counter() if args.profile else None
                         kpts_out = []
+                        debug_inputs = []
                         for i in range(preds_last.shape[0]):
                             heatmaps = preds_last[i]
                             coords = decode_heatmaps(heatmaps)
 
                             H_hm, W_hm = heatmaps.shape[1:]
-                            W_face = args.input_size
-                            H_face = args.input_size
+                            W_face = float(preprocess_size[0])
+                            H_face = float(preprocess_size[1])
                             coords[:, 0] *= (W_face / W_hm)
                             coords[:, 1] *= (H_face / H_hm)
+
+                            if args.show_input_crops and i < len(face_inputs_bgr):
+                                dbg = face_inputs_bgr[i].copy()
+                                draw_landmarks(dbg, coords, color=(0, 0, 255))
+                                cv2.putText(dbg, f"face {i}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                debug_inputs.append(dbg)
 
                             x1, y1, x2, y2 = boxes_clamped[i]
                             scale_x = (x2 - x1) / float(W_face)
@@ -623,8 +958,24 @@ def main():
 
                             kpts_out.append(coords)
 
+                        if args.show_input_crops and debug_inputs:
+                            last_debug_tile = _tile_same_size(debug_inputs, cols=args.debug_crops_cols)
+
                         last_kpts = kpts_out
                         last_kpts_frame = processed
+
+                        if obj_pts_3d is not None:
+                            pnp_out = []
+                            for i in range(len(kpts_out)):
+                                sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
+                                if sol is None:
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None})
+                                    continue
+                                rvec, tvec = sol
+                                proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
+                                pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj})
+                            last_pnp = pnp_out
+                            last_pnp_frame = processed
 
                         if args.profile:
                             prof["decode_draw"] += perf_counter() - t1
@@ -643,6 +994,20 @@ def main():
                         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
                     if i < len(last_kpts):
                         draw_landmarks(frame_bgr, last_kpts[i], color=(0, 0, 255))
+
+                        if args.draw_pnp and obj_pts_3d is not None and i < len(last_pnp):
+                            proj = last_pnp[i].get("proj") if isinstance(last_pnp[i], dict) else None
+                            if proj is not None:
+                                draw_landmarks(frame_bgr, proj, color=(0, 255, 0))
+
+                        if args.draw_axes and obj_pts_3d is not None and i < len(last_pnp):
+                            rvec = last_pnp[i].get("rvec") if isinstance(last_pnp[i], dict) else None
+                            tvec = last_pnp[i].get("tvec") if isinstance(last_pnp[i], dict) else None
+                            if rvec is not None and tvec is not None:
+                                try:
+                                    cv2.drawFrameAxes(frame_bgr, K_cam, dist, rvec, tvec, float(args.axes_len), 2)
+                                except Exception:
+                                    pass
                 if args.profile:
                     prof["decode_draw"] += perf_counter() - t0
 
@@ -661,6 +1026,8 @@ def main():
                         interpolation=cv2.INTER_LINEAR,
                     )
                 cv2.imshow(window_name, disp)
+                if args.show_input_crops and last_debug_tile is not None:
+                    cv2.imshow(f"{window_name}_inputs", last_debug_tile)
                 key = cv2.waitKey(1 if not paused else 30) & 0xFF
                 if key in (ord("q"), 27):
                     stop_requested["stop"] = True
