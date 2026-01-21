@@ -139,6 +139,15 @@ def _project_points(obj_pts_3d: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, 
     return proj.reshape(-1, 2).astype(np.float32)
 
 
+def _mean_reprojection_error(img_pts_2d: np.ndarray, proj_pts_2d: np.ndarray) -> float:
+    n = min(int(img_pts_2d.shape[0]), int(proj_pts_2d.shape[0]))
+    if n <= 0:
+        return float("inf")
+    diff = proj_pts_2d[:n].astype(np.float32) - img_pts_2d[:n].astype(np.float32)
+    err = np.linalg.norm(diff, axis=1)
+    return float(np.mean(err))
+
+
 def _tile_same_size(images: list[np.ndarray], cols: int = 4, pad: int = 6, bg: Tuple[int, int, int] = (16, 16, 16)) -> np.ndarray:
     """Tile images (all same HxW) into a grid."""
     if not images:
@@ -535,6 +544,19 @@ def main():
     parser.add_argument("--skip-frames", type=int, default=1)
     parser.add_argument("--draw-face-box", action="store_true")
     parser.add_argument("--draw-crop-box", action="store_true", help="Draw the square crop box actually used for inference")
+    parser.add_argument(
+        "--draw-detected-landmarks",
+        dest="draw_detected_landmarks",
+        action="store_true",
+        help="Draw detected/predicted 2D landmarks",
+    )
+    parser.add_argument(
+        "--no-draw-detected-landmarks",
+        dest="draw_detected_landmarks",
+        action="store_false",
+        help="Do not draw detected/predicted 2D landmarks",
+    )
+    parser.set_defaults(draw_detected_landmarks=False)
     # Default to 0 because training bbox-crop doesn't add arbitrary padding.
     parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
     parser.add_argument("--display", action="store_true", help="Show real-time preview window")
@@ -549,6 +571,12 @@ def main():
     parser.add_argument("--draw-axes", action="store_true", help="Draw pose axes (requires --model-3d-xml)")
     parser.add_argument("--axes-len", type=float, default=0.05, help="Axes length in 3D units (same units as XML)")
     parser.add_argument("--pnp-method", choices=["iterative", "epnp", "p3p", "ap3p"], default="iterative")
+    parser.add_argument(
+        "--pnp-max-reproj-err",
+        type=float,
+        default=8.0,
+        help="Discard PnP result if mean reprojection error (pixels) is above this threshold",
+    )
     parser.add_argument("--cam-fx", type=float, default=None, help="Camera fx in pixels (default: derived)")
     parser.add_argument("--cam-fy", type=float, default=None, help="Camera fy in pixels (default: derived)")
     parser.add_argument("--cam-cx", type=float, default=None, help="Camera cx in pixels (default: W/2)")
@@ -690,7 +718,7 @@ def main():
     last_kpts_frame = -10**9
 
     # PnP caching (aligned with last_kpts)
-    last_pnp = []  # list[dict] with rvec,tvec,proj
+    last_pnp = []  # list[dict] with rvec,tvec,proj,err
     last_pnp_frame = -10**9
 
     # debug crop caching
@@ -914,11 +942,15 @@ def main():
                             for i in range(len(kpts_out)):
                                 sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
                                 if sol is None:
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None})
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": None})
                                     continue
                                 rvec, tvec = sol
                                 proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
-                                pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj})
+                                err = _mean_reprojection_error(kpts_out[i], proj)
+                                if err > float(args.pnp_max_reproj_err):
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": float(err)})
+                                else:
+                                    pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj, "err": float(err)})
                             last_pnp = pnp_out
                             last_pnp_frame = processed
                         if args.profile:
@@ -969,11 +1001,15 @@ def main():
                             for i in range(len(kpts_out)):
                                 sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
                                 if sol is None:
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None})
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": None})
                                     continue
                                 rvec, tvec = sol
                                 proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
-                                pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj})
+                                err = _mean_reprojection_error(kpts_out[i], proj)
+                                if err > float(args.pnp_max_reproj_err):
+                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": float(err)})
+                                else:
+                                    pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj, "err": float(err)})
                             last_pnp = pnp_out
                             last_pnp_frame = processed
 
@@ -993,17 +1029,18 @@ def main():
                         y2 = min(H - 1, int(y + h) + pad)
                         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
                     if i < len(last_kpts):
-                        draw_landmarks(frame_bgr, last_kpts[i], color=(0, 0, 255))
+                        if args.draw_detected_landmarks:
+                            draw_landmarks(frame_bgr, last_kpts[i], color=(0, 0, 255))
 
-                        if args.draw_pnp and obj_pts_3d is not None and i < len(last_pnp):
+                        if obj_pts_3d is not None and i < len(last_pnp):
                             proj = last_pnp[i].get("proj") if isinstance(last_pnp[i], dict) else None
-                            if proj is not None:
-                                draw_landmarks(frame_bgr, proj, color=(0, 255, 0))
-
-                        if args.draw_axes and obj_pts_3d is not None and i < len(last_pnp):
                             rvec = last_pnp[i].get("rvec") if isinstance(last_pnp[i], dict) else None
                             tvec = last_pnp[i].get("tvec") if isinstance(last_pnp[i], dict) else None
-                            if rvec is not None and tvec is not None:
+
+                            if args.draw_pnp and proj is not None:
+                                draw_landmarks(frame_bgr, proj, color=(0, 255, 0))
+
+                            if args.draw_axes and rvec is not None and tvec is not None:
                                 try:
                                     cv2.drawFrameAxes(frame_bgr, K_cam, dist, rvec, tvec, float(args.axes_len), 2)
                                 except Exception:
