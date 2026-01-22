@@ -3,52 +3,73 @@ seed: 1337
 
 data:
   type: coco_face
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations/val.json"
-  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  train_datasets:
+
+    - name: 300w_xreal_air2
+      train_json: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      loss_weight: 0.4
+  # Multi-dataset validation.
+  primary_val: 300w_xreal_air2
+  val_datasets:
+    - name: 300w_xreal_air2
+      val_json: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.2
+      
   input_size: [256, 256]
   heatmap_size: [64, 64]
   batch_size: 32
+  # Windows tends to be more stable with num_workers=0 unless you really need speed.
   num_workers: 0
   aug:
     use_bbox_crop: true
     face_margin: 0.25
     hflip_p: 0.5
-    rotation: 15
-    scale: 0.1
-    color_jitter: 0.15
+    rotation: 10
+    scale: 0.15
+    color_jitter: 0.20
     aug_factor: 1
     content:
-      brightness_contrast_p: 0.5
-      sunflare_p: 0.15
-      motion_blur_p: 0.15
-      gauss_noise_p: 0.2
+      brightness_contrast_p: 0.6
+      sunflare_p: 0.10
+      motion_blur_p: 0.20
+      gauss_noise_p: 0.25
       gauss_noise_var: [10.0, 50.0]
       compression_p: 0.2
       compression_quality: [60, 100]
 
 model:
   name: tiny_face
+  # Keep this model extremely lightweight for fast GPU inference.
+  backbone: mobilenet_v3_small
+  width_mult: 1.0
   pretrained: true
-  embed_dim: 512
+  embed_dim: 128
+  dropout: 0.1
+
+loss:
+  name: bbox_detector
+  conf_weight: 1.0
+  bbox_weight: 5.0
+  bbox_loss: smooth_l1
 
 train:
   epochs: 100
-  lr: 0.0001
-  weight_decay: 0.0001
-  optimizer: "adam"
-  lr_schedule: multistep
-  lr_steps: [20, 25]
-  lr_gamma: 0.1
-  warmup_epochs: 5
+  # AdamW + cosine tends to work better for lightweight detectors than Adam + multistep.
+  lr: 0.0003
+  weight_decay: 0.0005
+  optimizer: "adamw"
+  lr_schedule: cosine_warmup
+  warmup_epochs: 3
   warmup_start_factor: 0.1
-  min_lr: 0.0
-  grad_clip_norm: 0.0
+  min_lr: 0.000001
+  grad_clip_norm: 1.0
   amp:
-    enabled: false
+    enabled: true
     dtype: fp16
   ema:
-    enabled: false
+    enabled: true
     decay: 0.999
     update_every: 1
     eval: true

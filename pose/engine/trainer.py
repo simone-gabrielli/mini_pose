@@ -103,7 +103,9 @@ class ModelEMA:
 
 import pose.data      # noqa: F401  # ensures datasets register
 import pose.models    # noqa: F401  # ensures models register
+import pose.detectors # noqa: F401  # ensure detectors register (e.g. tiny_face)
 import pose.losses    # noqa: F401  # ensures losses register
+import inspect
 from pose.registry import MODEL_REGISTRY, LOSS_REGISTRY, DATASET_REGISTRY
 from pose.engine.metrics import compute_pck, compute_nme
 from pose.data import DatasetSpec, WeightedConcatDataset
@@ -333,11 +335,33 @@ class Trainer:
         if hasattr(self.train_ds, "depth_mean") and self.train_ds.depth_mean is not None:
             model_kwargs["depth_mean"] = self.train_ds.depth_mean
 
-        self.model = ModelCls(**model_kwargs).to(self.device)
+        # Only pass kwargs that the model constructor actually accepts.
+        # Some registered classes (e.g. detector heads) do not accept
+        # `num_keypoints` or other pose-specific kwargs; guard against
+        # passing unexpected arguments by inspecting the __init__
+        try:
+            sig = inspect.signature(ModelCls.__init__)
+            params = sig.parameters
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if accepts_var_kw:
+                kwargs_to_pass = model_kwargs
+            else:
+                allowed = {name for name in params.keys() if name != "self"}
+                kwargs_to_pass = {k: v for k, v in model_kwargs.items() if k in allowed}
+        except Exception:
+            kwargs_to_pass = model_kwargs
+
+        self.model = ModelCls(**kwargs_to_pass).to(self.device)
 
         # Loss
-        LossCls = LOSS_REGISTRY[cfg["loss"]["name"]]
-        self.criterion = LossCls().to(self.device)
+        loss_cfg = cfg.get("loss", {})
+        if not isinstance(loss_cfg, dict) or "name" not in loss_cfg:
+            raise KeyError("Config is missing required key: loss.name")
+
+        LossCls = LOSS_REGISTRY[loss_cfg["name"]]
+        # Pass loss_cfg kwargs through (excluding 'name') so losses can be configured.
+        loss_kwargs = {k: v for k, v in loss_cfg.items() if k != "name"}
+        self.criterion = LossCls(**loss_kwargs).to(self.device)
 
         # auxiliary 2D MSE for spatial heatmap supervision when using 3D volumetric loss
         self._mse2d = torch.nn.MSELoss(reduction="mean")
@@ -559,8 +583,14 @@ class Trainer:
             )
 
             with autocast_ctx:
+                # Branch: bbox detector (single box + confidence)
+                if "bbox" in batch:
+                    targets_bbox = batch["bbox"].to(self.device)
+                    preds_bbox = self.model(imgs)
+                    loss = self.criterion(preds_bbox, targets_bbox, sample_weight=sample_weight)
+
                 # Branch: direct pose regression with reprojection loss
-                if loss_name == "pose_reprojection":
+                elif loss_name == "pose_reprojection":
                     out = self.model(imgs)
                     if isinstance(out, dict):
                         preds_2d = out.get("proj")
@@ -683,6 +713,9 @@ class Trainer:
         coord_targets: list[np.ndarray] = []
         is_coord_regression = loss_name in coord_regression_losses
 
+        det_iou_sum = 0.0
+        det_iou_n = 0
+
         # Optionally evaluate EMA weights.
         eval_ctx = self.ema.apply_to(self.model) if (self.ema is not None and self.ema_eval) else nullcontext()
 
@@ -693,7 +726,41 @@ class Trainer:
                 if sample_weight is not None:
                     sample_weight = sample_weight.to(self.device)
 
-                if loss_name == "pose_reprojection":
+                # Branch: bbox detector
+                if "bbox" in batch:
+                    targets_bbox = batch["bbox"].to(self.device)
+                    preds_bbox = self.model(imgs)
+                    loss = self.criterion(preds_bbox, targets_bbox, sample_weight=sample_weight)
+                    preds_last = None
+
+                    # Basic detector metrics (only for positives)
+                    try:
+                        conf_t = targets_bbox[:, 0]
+                        pos = conf_t > 0.5
+                        if pos.any():
+                            # IoU between predicted and gt bboxes in normalized coords
+                            pb = torch.sigmoid(preds_bbox[:, 1:5])
+                            gb = targets_bbox[:, 1:5].clamp(0.0, 1.0)
+                            pb = pb[pos]
+                            gb = gb[pos]
+
+                            ix1 = torch.max(pb[:, 0], gb[:, 0])
+                            iy1 = torch.max(pb[:, 1], gb[:, 1])
+                            ix2 = torch.min(pb[:, 2], gb[:, 2])
+                            iy2 = torch.min(pb[:, 3], gb[:, 3])
+
+                            iw = (ix2 - ix1).clamp(min=0.0)
+                            ih = (iy2 - iy1).clamp(min=0.0)
+                            inter = iw * ih
+                            a_p = (pb[:, 2] - pb[:, 0]).clamp(min=0.0) * (pb[:, 3] - pb[:, 1]).clamp(min=0.0)
+                            a_g = (gb[:, 2] - gb[:, 0]).clamp(min=0.0) * (gb[:, 3] - gb[:, 1]).clamp(min=0.0)
+                            iou = inter / (a_p + a_g - inter).clamp(min=1e-6)
+                            det_iou_sum += float(iou.mean().item())
+                            det_iou_n += 1
+                    except Exception:
+                        pass
+
+                elif loss_name == "pose_reprojection":
                     out = self.model(imgs)
                     if isinstance(out, dict):
                         preds_2d = out.get("proj")
@@ -791,6 +858,8 @@ class Trainer:
             "_loss_sum": float(running_loss),
             "_num_batches": float(num_batches),
         }
+        if det_iou_n > 0:
+            metrics["iou"] = float(det_iou_sum / float(det_iou_n))
         if coord_preds:
             try:
                 coord_preds_arr = np.stack(coord_preds)

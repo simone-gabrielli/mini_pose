@@ -93,6 +93,14 @@ pip install -e .
 python scripts/train.py --config configs/face68_hourglass.yaml
 ```
 
+### Train a lightweight face bbox detector:
+
+```bash
+python scripts/train.py --config configs/face_mobilenet.yaml
+```
+
+This uses dataset type `coco_face` (single-face bbox regression with optional negative images) and loss `bbox_detector`.
+
 ### Train on multiple datasets (importance-weighted):
 
 Use `data.train_datasets` to mix multiple COCO-style datasets during training.

@@ -62,9 +62,10 @@ class CocoFaceDataset(Dataset):
 
             if img_id in ann_by_img:
                 bbox = ann_by_img[img_id]["bbox"]
+                # Keep COCO bbox format (x, y, w, h) in pixels.
+                # The augmentation pipeline expects xywh when values are > 1.
                 x, y, w, h = bbox
-                x1, y1, x2, y2 = x, y, x + w, y + h
-                self.items.append({"path": path, "bbox": [x1, y1, x2, y2], "width": info.get("width"), "height": info.get("height")})
+                self.items.append({"path": path, "bbox": [x, y, w, h], "width": info.get("width"), "height": info.get("height")})
             else:
                 # negative sample: no face
                 self.items.append({"path": path, "bbox": None, "width": info.get("width"), "height": info.get("height")})
@@ -123,10 +124,12 @@ class CocoFaceDataset(Dataset):
             x1 = y1 = x2 = y2 = 0.0
             conf = 0.0
         else:
-            x1 = bbox[0] / W
-            y1 = bbox[1] / H
-            x2 = bbox[2] / W
-            y2 = bbox[3] / H
+            # bbox is COCO xywh in pixels
+            x, y, w, h = bbox
+            x1 = float(x) / float(W)
+            y1 = float(y) / float(H)
+            x2 = float(x + w) / float(W)
+            y2 = float(y + h) / float(H)
             conf = 1.0
 
         # Pass bbox through augmentation pipeline so flares/occlusions/flip affect it
@@ -135,7 +138,9 @@ class CocoFaceDataset(Dataset):
             # negative sample: keep zero bbox
             target = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
         else:
-            img_t, _, bbox_t = self.transform(img, keypoints=None, bbox=[bbox[0], bbox[1], bbox[2], bbox[3]])
+            # pass bbox as COCO xywh in pixels
+            x, y, w, h = bbox
+            img_t, _, bbox_t = self.transform(img, keypoints=None, bbox=[x, y, w, h])
             if bbox_t is None:
                 # fallback to normalized coords from original size
                 target = torch.tensor([conf, x1, y1, x2, y2], dtype=torch.float32)
