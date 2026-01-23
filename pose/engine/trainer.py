@@ -1,4 +1,24 @@
-# pose/engine/trainer.py
+"""Training engine.
+
+`Trainer` is the central orchestrator of mini-pose training. It wires together:
+    - dataset(s) via `DATASET_REGISTRY`
+    - model via `MODEL_REGISTRY`
+    - loss via `LOSS_REGISTRY`
+    - optimizer/scheduler/regularization (AMP, EMA, grad clipping)
+
+The design goal is to keep the training loop *model-agnostic* while supporting
+multiple task styles:
+    - heatmap keypoints (common)
+    - coordinate regression (LOTR-style)
+    - bbox-only detector heads
+    - pose reprojection losses (e.g. projecting a known 3D CAD model)
+
+If you are trying to understand the project end-to-end, start at:
+    - `scripts/train.py` (CLI)
+    - `Trainer.__init__` (builds datasets/model/loss)
+    - `Trainer.train_epoch` (forward/loss branches)
+    - `Trainer.validate_epoch` (metrics + checkpoint selection)
+"""
 
 import os
 import shutil
@@ -111,6 +131,25 @@ from pose.engine.metrics import compute_pck, compute_nme
 from pose.data import DatasetSpec, WeightedConcatDataset
 
 class Trainer:
+    """Train/evaluate a model defined by a YAML config.
+
+        Expected config sections:
+            - cfg['data']  : dataset type + paths + preprocessing sizes
+            - cfg['model'] : model registry key + constructor kwargs
+            - cfg['loss']  : loss registry key + constructor kwargs
+            - cfg['train'] : epochs/lr/optimizer/scheduler/output_dir + optional AMP/EMA
+
+        Expected dataset batch format (dict):
+            - 'image'   : (B,3,H,W) float tensor, ImageNet-normalized
+            - 'visible' : (B,K) visibility mask for keypoints (when applicable)
+            - 'heatmaps' / 'heatmaps_3d' : supervision targets for heatmap models
+            - 'keypoints': (B,K,3) with (x,y,vis/score) in *input crop pixel space*
+            - optional task-specific keys:
+                - 'bbox' (bbox detector)
+                - 'pose_weights' (reprojection loss)
+                - 'dataset_weight' (for multi-dataset weighted sampling)
+    """
+
     def __init__(self, cfg: Dict[str, Any], device: str = "cuda"):
         self.cfg = cfg
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -554,6 +593,18 @@ class Trainer:
         self.history[split][name].append(float(value))
 
     def train_epoch(self, epoch: int):
+        """Run one training epoch.
+
+        The forward/loss path depends on both the *loss name* and the presence of
+        specific batch keys:
+          - if batch contains 'bbox' -> bbox detector path
+          - elif loss == 'pose_reprojection' -> dict output with 'proj'
+          - elif loss in coord_regression_losses -> direct coordinate regression
+          - else -> heatmap training (2D or 3D) with (possibly) intermediate supervision
+
+        Returns:
+            Mean training loss over the epoch.
+        """
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [train]")
         running_loss = 0.0
@@ -872,6 +923,15 @@ class Trainer:
 
     @torch.no_grad()
     def validate_epoch(self, epoch: int):
+        """Validate on the configured val dataset(s) and return aggregate loss.
+
+        - If multiple val datasets are configured, we evaluate all and compute a
+          batch-count-aware weighted average loss for checkpoint selection.
+        - PCK/NME are reported for the *primary* val dataset when available.
+
+        Returns:
+            Aggregate validation loss (lower is better).
+        """
         # Validate each configured val dataset, then aggregate into a single scalar
         # for checkpoint selection.
         per_ds: dict[str, dict[str, float]] = {}
@@ -1077,6 +1137,16 @@ class Trainer:
             self.start_epoch = ckpt["epoch"] + 1
 
     def run(self, resume_path: str = None):
+        """Main training loop.
+
+        Responsibilities:
+          - optionally resume model/optimizer/scheduler/scaler/EMA
+          - run epoch loop (train -> validate -> scheduler.step)
+          - keep track of best validation loss and write `best.pth`
+          - periodically save qualitative examples + final training report
+
+        This method also handles Ctrl+C gracefully by saving a last checkpoint.
+        """
         if resume_path is not None:
             self._load_checkpoint(resume_path)
 

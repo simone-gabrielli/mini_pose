@@ -7,7 +7,11 @@ from pose.models.base import PoseModel
 from pose.registry import register_model
 
 class ConvBlock(nn.Module):
-    # ...existing code...
+    """FAN convBlock (Torch7-style).
+
+    This file intentionally mirrors the FAN implementation structure so that
+    porting weights / comparing to reference implementations is straightforward.
+    """
     def __init__(self, num_in: int, num_out: int):
         super().__init__()
         mid1 = num_out // 2
@@ -28,7 +32,7 @@ class ConvBlock(nn.Module):
         return out
 
 class SkipLayer(nn.Module):
-    # ...existing code...
+    """Skip/projection layer used by FAN residual blocks."""
     def __init__(self, num_in: int, num_out: int):
         super().__init__()
         if num_in == num_out:
@@ -43,7 +47,7 @@ class SkipLayer(nn.Module):
         return self.proj(x)
 
 class ResidualFan(nn.Module):
-    # ...existing code...
+    """Residual block used by FAN: conv path + skip path."""
     def __init__(self, num_in: int, num_out: int):
         super().__init__()
         self.conv_block = ConvBlock(num_in, num_out)
@@ -52,7 +56,13 @@ class ResidualFan(nn.Module):
         return self.conv_block(x) + self.skip(x)
 
 class HourglassFan(nn.Module):
-    # ...existing code...
+    """Recursive hourglass module used by FAN.
+
+    Args:
+        depth: number of down/up levels (typically 4)
+        num_feats: feature channel count
+        n_modules: number of residual modules per stage
+    """
     def __init__(self, depth: int, num_feats: int, n_modules: int):
         super().__init__()
         self.depth = depth
@@ -85,7 +95,21 @@ def lin_layer(num_in: int, num_out: int):
 
 @register_model("fan3d")
 class Fan3D(PoseModel):
-    """FAN3D: FAN2D with additional depth head."""
+        """FAN3D: FAN heatmaps + an additional per-pixel depth head.
+
+        Compared to `fan_2d`, this model adds a second prediction head per stack:
+            - `pred_layers[i]` produces 2D landmark heatmaps (K channels)
+            - `depth_layers[i]` produces a depth map (typically 1 channel)
+
+        Forward returns a 4-tuple:
+            - last_heatmaps: (B, K, Hh, Wh)
+            - all_heatmaps:  list[(B, K, Hh, Wh)] for intermediate supervision
+            - last_depth:    (B, D, Hh, Wh) (D usually 1)
+            - all_depth:     list[(B, D, Hh, Wh)]
+
+        The Trainer will choose the appropriate loss branch based on `cfg.loss.name`
+        (e.g. `heatmap_3d_mse` may use volumetric targets instead).
+        """
     def __init__(
         self,
         num_stacks: int = 8,
@@ -135,6 +159,11 @@ class Fan3D(PoseModel):
             for _ in range(num_stacks - 1)
         ])
     def forward(self, x):
+        """Compute heatmaps and depth maps.
+
+        Args:
+            x: (B, 3, H, W)
+        """
         x = self.relu(self.bn1(self.cnv1(x)))
         x = self.res1(x)
         x = self.pool(x)

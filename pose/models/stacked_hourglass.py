@@ -1,4 +1,14 @@
-# pose/models/stacked_hourglass.py
+"""Stacked Hourglass keypoint model.
+
+This is a compact, readable implementation of Newell et al.'s stacked hourglass
+architecture with intermediate supervision.
+
+Conventions used throughout mini-pose:
+    - Input images are `(B, 3, H, W)` (typically H=W=256).
+    - Heatmap outputs are `(B, K, Hh, Wh)` (often Hh=Wh=64).
+    - Models usually return `(pred_last, preds_all)` so the Trainer can apply
+        deep supervision losses across stacks.
+"""
 
 import torch
 import torch.nn as nn
@@ -9,6 +19,7 @@ from pose.registry import register_model
 
 
 class ResidualBlock(nn.Module):
+    """Standard bottleneck-ish residual block used inside the hourglass."""
     def __init__(self, in_channels, out_channels):
         super().__init__()
         mid_channels = out_channels // 2
@@ -40,6 +51,10 @@ class ResidualBlock(nn.Module):
 
 
 class Hourglass(nn.Module):
+    """Recursive hourglass module.
+
+    `depth` controls the number of down/up sampling levels.
+    """
     def __init__(self, depth, num_features):
         super().__init__()
         self.depth = depth
@@ -75,6 +90,12 @@ class Hourglass(nn.Module):
 
 @register_model("stacked_hourglass")
 class StackedHourglass(PoseModel):
+        """Stacked hourglass model producing K heatmaps.
+
+        Forward returns:
+            - pred_last: (B, K, Hh, Wh)
+            - preds_all: list[(B, K, Hh, Wh)] with length = num_stacks
+        """
     def __init__(
         self,
         num_stacks: int,
@@ -130,6 +151,14 @@ class StackedHourglass(PoseModel):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        """Compute heatmaps.
+
+        Args:
+            x: (B, 3, H, W)
+
+        Returns:
+            (pred_last, preds_all)
+        """
         x = self.pre(x)
         outputs = []
 

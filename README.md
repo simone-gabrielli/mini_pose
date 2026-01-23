@@ -21,6 +21,10 @@ The framework supports:
 - **Multiple loss functions**  
 - **PCK and NME metrics**  
 - **Clean modular design**  
+- **Multi-dataset training + weighted validation aggregation**
+- **Mixed precision (AMP) and EMA weights (optional)**
+- **Video inference utilities (multiple face detector backends + optional PnP)**
+- **Lightweight bbox detector (TinyFace) training + inference**
 
 ---
 
@@ -52,7 +56,7 @@ mini_pose/
     train.py
     infer.py
   configs/
-    face68_hourglass.yaml
+    xreal_mobilenet.yaml
   requirements.txt
   README.md
 ```
@@ -90,7 +94,7 @@ pip install -e .
 ### Train a model:
 
 ```bash
-python scripts/train.py --config configs/face68_hourglass.yaml
+python scripts/train.py --config configs/xreal_mobilenet.yaml
 ```
 
 ### Train a lightweight face bbox detector:
@@ -101,6 +105,12 @@ python scripts/train.py --config configs/face_mobilenet.yaml
 
 This uses dataset type `coco_face` (single-face bbox regression with optional negative images) and loss `bbox_detector`.
 
+If you want the legacy dedicated trainer for the detector, it’s still available:
+
+```bash
+python scripts/train_face_detector.py --config configs/face_mobilenet.yaml
+```
+
 ### Train on multiple datasets (importance-weighted):
 
 Use `data.train_datasets` to mix multiple COCO-style datasets during training.
@@ -108,10 +118,25 @@ Each dataset can have its own `loss_weight` to scale its contribution to the tot
 
 See the full example config at configs/xreal_mobilenet_hmd_plus_air2.yaml.
 
+### Optional: enable AMP / EMA
+
+Most configs can opt into mixed precision and/or EMA weights:
+
+```yaml
+train:
+  amp:
+    enabled: true
+    dtype: fp16
+  ema:
+    enabled: true
+    decay: 0.999
+    eval: true
+```
+
 ### Run inference:
 
 ```bash
-python scripts/infer.py --checkpoint work_dirs/face68_hourglass/best.pth                         --image test.jpg                         --num-keypoints 68
+python scripts/infer.py --config configs/xreal_mobilenet.yaml --checkpoint work_dirs/xreal_mobilenet/best.pth --image test.jpg
 ```
 
 Outputs a `debug_out.png` with detected points.
@@ -303,10 +328,10 @@ And call it inside validation.
 
 ## 5. Config Format
 
-Example: `configs/face68_hourglass.yaml`
+Example (simplified schema):
 
 ```yaml
-experiment: face68_hourglass
+experiment: example_hourglass
 seed: 42
 
 data:
@@ -374,7 +399,7 @@ train:
   optimizer: adam
   lr_steps: [30, 40]
   lr_gamma: 0.1
-  output_dir: "work_dirs/face68_hourglass"
+  output_dir: "work_dirs/example_hourglass"
 
   # --- Optional regularization bundle ---
   # Optimizer + schedule
@@ -434,10 +459,60 @@ You already have a DLIB → COCO converter.
 ## 8. Inference
 
 ```bash
-python scripts/infer.py     --checkpoint work_dirs/face68_hourglass/best.pth     --image test.jpg
+python scripts/infer.py --config configs/xreal_mobilenet.yaml --checkpoint work_dirs/xreal_mobilenet/best.pth --image test.jpg
 ```
 
 Result saved as `debug_out.png`.
+
+---
+
+## 8.1 Inference cookbook
+
+### A) Single image inference (heatmap models)
+
+```bash
+python scripts/infer.py --checkpoint work_dirs/face_mobilenet/best.pth --model-name mobilenet_pose --num-keypoints 68 --image path/to/img.jpg
+```
+
+### B) Single image inference (config-driven; recommended for LOTR)
+
+Use this when the model’s preprocessing size must match `cfg.data.input_size`:
+
+```bash
+python scripts/infer.py --config configs/xreal_lotr.yaml --checkpoint work_dirs/xreal_lotr/best.pth --image path/to/img.jpg
+```
+
+### C) COCO JSON sampling (quick qualitative sweep)
+
+```bash
+python scripts/infer.py --config configs/xreal_fan2d.yaml --checkpoint work_dirs/xreal_fan2d/best.pth --coco-json datasets/300W-xreal_air2/val.json --images-root datasets/300W-xreal_air2 --sample-percent 5 --out-dir outputs/infer_air2
+```
+
+### D) Video inference (multiple face detectors + batching)
+
+```bash
+python scripts/infer_video.py --config configs/xreal_fan2d.yaml --checkpoint work_dirs/xreal_fan2d/best.pth --input-video input.mp4 --fp16 --detector auto --output-video outputs/out.mp4
+```
+
+If you have a 3D landmark template XML, you can enable a lightweight head-pose overlay (solvePnP):
+
+```bash
+python scripts/infer_video.py --config configs/xreal_fan3d.yaml --checkpoint work_dirs/xreal_fan3d/best.pth --input-video input.mp4 --model-3d-xml datasets/300W-xreal_air2_pyrender/_tmp_glasses_rgba/model.xml --draw-pnp --draw-axes
+```
+
+### E) BBox-only inference (TinyFace)
+
+COCO dataset mode:
+
+```bash
+python scripts/infer_bbox.py --config configs/face_mobilenet.yaml --checkpoint work_dirs/face_mobilenet/best.pth --dataset datasets/300W-xreal_air2 --split val --out-dir outputs/infer_bbox
+```
+
+Folder mode:
+
+```bash
+python scripts/infer_bbox.py --checkpoint work_dirs/face_mobilenet/best.pth --images-dir path/to/images --out-dir outputs/infer_bbox
+```
 
 ---
 
@@ -446,6 +521,14 @@ Result saved as `debug_out.png`.
 ```python
 torch.onnx.export(model, dummy_input, "pose.onnx", opset=17)
 ```
+
+---
+
+## 11. Practical tips / gotchas
+
+- **Match preprocessing size**: for coordinate regression models (LOTR), always prefer `--config` inference so `cfg.data.input_size` is used. If you change `--input-size` at inference time you can introduce large scale/offset errors.
+- **Registry errors** (e.g. `KeyError: 'fan_2d'`): ensure the module is imported so decorators run. Scripts and Trainer do `import pose.models`/`pose.losses`/`pose.data` for this reason.
+- **Multi-dataset validation**: when `data.val_datasets` is provided, the Trainer logs per-dataset metrics and aggregates loss in a batch-count-aware way so small val sets don’t dominate.
 
 ---
 

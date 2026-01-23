@@ -215,6 +215,15 @@ def _load_tinyface_model(
     ema_mode: str,
     config_raw: Optional[dict],
 ) -> TinyFaceDetector:
+    # TinyFaceDetector is used both as a train-time model (in configs/face_mobilenet.yaml)
+    # and as an inference-only module here.
+    #
+    # Output convention (per image):
+    #   preds: (B, 5)
+    #     preds[:,0]   -> confidence logits
+    #     preds[:,1:5] -> bbox coordinates (normalized x1,y1,x2,y2) after sigmoid
+    #
+    # Mapping normalized bbox back to pixels requires multiplying by (W,H).
     model = TinyFaceDetector(
         pretrained=bool(pretrained),
         backbone=str(backbone),
@@ -228,6 +237,10 @@ def _load_tinyface_model(
     except TypeError:
         ckpt = torch.load(checkpoint_path, map_location="cpu")
 
+    # EMA selection:
+    # - on  : force using EMA shadow weights if present
+    # - off : always use raw model weights
+    # - auto: follow cfg.train.ema.eval when config is available
     ema_mode_n = str(ema_mode).lower().strip() if ema_mode is not None else "auto"
     use_ema = False
     if ema_mode_n == "on":
@@ -243,6 +256,9 @@ def _load_tinyface_model(
         else:
             use_ema = False
 
+    # Checkpoint format flexibility:
+    # - trainer checkpoints typically store {model, optimizer, ema, ...}
+    # - some scripts may store a raw state_dict
     state_dict = None
     if use_ema:
         state_dict = _select_ema_shadow_state_dict(ckpt)
