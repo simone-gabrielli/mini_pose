@@ -30,6 +30,121 @@ from pose.registry import MODEL_REGISTRY
 import pose.models  # noqa: F401
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--input-video", required=True)
+    parser.add_argument("--output-video", default=None)
+    parser.add_argument("--model-name", default="fan_2d")
+    parser.add_argument("--num-keypoints", type=int, default=68)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--input-size", type=int, default=256)
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Optional YAML config (recommended for LOTR). If set, preprocessing size defaults to cfg.data.input_size.",
+    )
+    parser.add_argument(
+        "--override-input-size",
+        action="store_true",
+        help="In --config mode, force using --input-size instead of cfg.data.input_size for preprocessing.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Use strict checkpoint loading (only applies when --config is set).",
+    )
+    parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around detected face box (training default)")
+
+    # If your input video is built from a COCO dataset (frames are the dataset images
+    # in the same order as COCO annotations), you can bypass detection entirely and
+    # use the dataset bbox for cropping. This matches training/val much closer.
+    parser.add_argument("--coco-json", default=None, help="Optional COCO json; if set, uses bboxes in annotation order per frame")
+    parser.add_argument("--detector", choices=["auto", "mtcnn", "yunet", "dlib", "composite", "haar", "tinyface"], default="auto")
+    parser.add_argument("--yunet-model", default=None, help="Path to YuNet ONNX model (required if --detector yunet)")
+    parser.add_argument("--yunet-score", type=float, default=0.4, help="YuNet score threshold")
+    parser.add_argument("--yunet-nms", type=float, default=0.3, help="YuNet NMS threshold")
+    parser.add_argument("--yunet-topk", type=int, default=5000, help="YuNet top_k")
+
+    parser.add_argument(
+        "--tinyface-checkpoint",
+        default=None,
+        help="Path to TinyFace detector checkpoint (.pth). If omitted, uses ImageNet-pretrained backbone weights only (not a detector checkpoint).",
+    )
+    parser.add_argument("--tinyface-input", type=int, default=256, help="TinyFace detector square input size")
+    parser.add_argument("--tinyface-conf", type=float, default=0.3, help="TinyFace confidence threshold")
+    parser.add_argument(
+        "--tinyface-backbone",
+        default="mobilenet_v3_small",
+        choices=["mobilenet_v2", "mobilenet_v3_small"],
+        help="TinyFace backbone architecture (must match training config when loading a checkpoint)",
+    )
+    parser.add_argument("--tinyface-width-mult", type=float, default=1.0, help="TinyFace MobileNet width multiplier")
+    parser.add_argument("--tinyface-embed-dim", type=int, default=128, help="TinyFace head embedding dimension")
+    parser.add_argument("--tinyface-dropout", type=float, default=0.1, help="TinyFace head dropout")
+    parser.add_argument("--tinyface-no-pretrained", action="store_true", help="Do not use ImageNet pretrained backbone when no checkpoint is provided")
+
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--max-faces", type=int, default=4)
+    parser.add_argument("--skip-frames", type=int, default=1)
+    parser.add_argument("--draw-face-box", action="store_true")
+    parser.add_argument("--draw-crop-box", action="store_true", help="Draw the square crop box actually used for inference")
+    parser.add_argument(
+        "--draw-detected-landmarks",
+        dest="draw_detected_landmarks",
+        action="store_true",
+        help="Draw detected/predicted 2D landmarks",
+    )
+    parser.set_defaults(draw_detected_landmarks=False)
+    # Default to 0 because training bbox-crop doesn't add arbitrary padding.
+    parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
+    parser.add_argument("--display", action="store_true", help="Show real-time preview window")
+    parser.add_argument(
+        "--show-input-crops",
+        action="store_true",
+        help="Show a debug window with the per-face 256x256 model inputs and landmarks overlaid",
+    )
+    parser.add_argument("--debug-crops-cols", type=int, default=4, help="Columns for the debug crops tiling window")
+    parser.add_argument("--model-3d-xml", default=None, help="Optional 3D landmark template XML; enables PnP + projection overlay")
+    parser.add_argument("--draw-pnp", action="store_true", help="Draw reprojected 3D landmarks (from solvePnP) over the frame")
+    parser.add_argument("--draw-axes", action="store_true", help="Draw pose axes (requires --model-3d-xml)")
+    parser.add_argument("--axes-len", type=float, default=0.05, help="Axes length in 3D units (same units as XML)")
+    parser.add_argument("--pnp-method", choices=["iterative", "epnp", "p3p", "ap3p"], default="iterative")
+    parser.add_argument(
+        "--pnp-max-reproj-err",
+        type=float,
+        default=8.0,
+        help="Discard PnP result if mean reprojection error (pixels) is above this threshold",
+    )
+    parser.add_argument("--cam-fx", type=float, default=None, help="Camera fx in pixels (default: derived)")
+    parser.add_argument("--cam-fy", type=float, default=None, help="Camera fy in pixels (default: derived)")
+    parser.add_argument("--cam-cx", type=float, default=None, help="Camera cx in pixels (default: W/2)")
+    parser.add_argument("--cam-cy", type=float, default=None, help="Camera cy in pixels (default: H/2)")
+    parser.add_argument("--cam-fov-deg", type=float, default=None, help="Optional horizontal FOV in degrees (used to estimate fx/fy)")
+    parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=1,
+        help="Run face detector every N processed frames; reuse last boxes in-between",
+    )
+    parser.add_argument(
+        "--detector-scale",
+        type=float,
+        default=1.0,
+        help="Downscale factor for face detection only (e.g. 0.5). Boxes are scaled back.",
+    )
+    parser.add_argument(
+        "--infer-every",
+        type=int,
+        default=1,
+        help="Run keypoint model every N processed frames; reuse last keypoints in-between",
+    )
+    parser.add_argument("--profile", action="store_true", help="Log per-stage timing breakdown")
+    parser.add_argument("--profile-every", type=int, default=60, help="Print timing every N processed frames")
+    return parser
+
+
 def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int, int] = (0, 0, 255)):
     for (xk, yk) in coords:
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
@@ -146,6 +261,31 @@ def _mean_reprojection_error(img_pts_2d: np.ndarray, proj_pts_2d: np.ndarray) ->
     diff = proj_pts_2d[:n].astype(np.float32) - img_pts_2d[:n].astype(np.float32)
     err = np.linalg.norm(diff, axis=1)
     return float(np.mean(err))
+
+
+def _run_pnp_batch(
+    obj_pts_3d: np.ndarray,
+    kpts_out: list[np.ndarray],
+    K_cam: np.ndarray,
+    dist: np.ndarray,
+    *,
+    method: str,
+    max_reproj_err: float,
+) -> list[dict]:
+    pnp_out = []
+    for i in range(len(kpts_out)):
+        sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=method)
+        if sol is None:
+            pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": None})
+            continue
+        rvec, tvec = sol
+        proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
+        err = _mean_reprojection_error(kpts_out[i], proj)
+        if err > float(max_reproj_err):
+            pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": float(err)})
+        else:
+            pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj, "err": float(err)})
+    return pnp_out
 
 
 def _tile_same_size(images: list[np.ndarray], cols: int = 4, pad: int = 6, bg: Tuple[int, int, int] = (16, 16, 16)) -> np.ndarray:
@@ -333,6 +473,15 @@ def build_detector(
     yunet_score_thresh: float = 0.8,
     yunet_nms_thresh: float = 0.3,
     yunet_top_k: int = 5000,
+    tinyface_checkpoint: str | None = None,
+    tinyface_input: int = 256,
+    tinyface_conf_thresh: float = 0.3,
+    tinyface_backbone: str = "mobilenet_v3_small",
+    tinyface_width_mult: float = 1.0,
+    tinyface_embed_dim: int = 128,
+    tinyface_dropout: float = 0.1,
+    tinyface_pretrained: bool = True,
+    fp16: bool = False,
 ):
     # MTCNN
     def make_mtcnn(device_str="cpu"):
@@ -463,6 +612,122 @@ def build_detector(
         except Exception:
             return None
 
+    # TinyFace single-box regressor
+    def make_tinyface(
+        checkpoint_path: str | None,
+        *,
+        input_size: int = 256,
+        conf_th: float = 0.3,
+        backbone: str = "mobilenet_v3_small",
+        width_mult: float = 1.0,
+        embed_dim: int = 128,
+        dropout: float = 0.1,
+        pretrained: bool = True,
+        fp16: bool = False,
+    ):
+        try:
+            from pose.detectors.face_detector import TinyFaceDetector
+        except Exception:
+            return None
+
+        def _get_state_dict(ckpt_obj: object) -> dict:
+            if isinstance(ckpt_obj, dict):
+                for k in ("model", "model_state", "state_dict", "weights"):
+                    sd = ckpt_obj.get(k)
+                    if isinstance(sd, dict):
+                        return sd
+                # maybe the dict itself is already a state_dict
+                if ckpt_obj and all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
+                    return ckpt_obj
+            if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
+                return ckpt_obj["model"]
+            raise ValueError("Unsupported checkpoint format")
+
+        def _strip_module_prefix(sd: dict) -> dict:
+            out = {}
+            for k, v in sd.items():
+                nk = k
+                if nk.startswith("module."):
+                    nk = nk[len("module.") :]
+                out[nk] = v
+            return out
+
+        # Instantiate with matching architecture; when loading a trained checkpoint,
+        # pretrained should be False to avoid downloading weights.
+        model = TinyFaceDetector(
+            pretrained=bool(pretrained and not checkpoint_path),
+            backbone=str(backbone),
+            width_mult=float(width_mult),
+            embed_dim=int(embed_dim),
+            dropout=float(dropout),
+        )
+
+        if checkpoint_path:
+            try:
+                ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                ckpt = torch.load(checkpoint_path, map_location="cpu")
+            sd = _strip_module_prefix(_get_state_dict(ckpt))
+            model.load_state_dict(sd, strict=True)
+
+        model.to(device)
+        model.eval()
+
+        if fp16 and device.type == "cuda":
+            try:
+                model = model.half()
+            except Exception:
+                pass
+
+        class TinyFaceWrapper:
+            def __init__(self, model, input_size: int, conf_th: float):
+                self.model = model
+                self.input_size = int(input_size)
+                self.conf_th = float(conf_th)
+
+            def detect(self, img_bgr):
+                H0, W0 = img_bgr.shape[:2]
+                if H0 <= 0 or W0 <= 0:
+                    return []
+
+                # Match the TinyFace training pipeline (AlbumentationsKeypointPipeline):
+                # resize to input_size and ImageNet mean/std normalization.
+                rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                s = max(32, int(self.input_size))
+                x_t = _preprocess_rgb_to_tensor(rgb, input_size=(s, s)).unsqueeze(0)
+                if fp16 and device.type == "cuda":
+                    x_t = x_t.half()
+                else:
+                    x_t = x_t.float()
+
+                with torch.inference_mode():
+                    res = self.model.predict(x_t, conf_th=self.conf_th)
+
+                if not res or res[0].get("bbox") is None:
+                    return []
+
+                x1, y1, x2, y2 = res[0]["bbox"]
+
+                # Map from square resized coords back to original frame coords.
+                sx = float(W0) / float(s)
+                sy = float(H0) / float(s)
+                x1 = int(round(float(x1) * sx))
+                y1 = int(round(float(y1) * sy))
+                x2 = int(round(float(x2) * sx))
+                y2 = int(round(float(y2) * sy))
+
+                # clamp
+                x1 = max(0, min(W0 - 1, x1))
+                y1 = max(0, min(H0 - 1, y1))
+                x2 = max(0, min(W0 - 1, x2))
+                y2 = max(0, min(H0 - 1, y2))
+
+                if x2 <= x1 or y2 <= y1:
+                    return []
+                return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1))]
+
+        return TinyFaceWrapper(model, input_size=input_size, conf_th=conf_th)
+
     if choice == "mtcnn":
         det = make_mtcnn(device_str=("cuda" if device.type == "cuda" else "cpu"))
         if det is None:
@@ -480,6 +745,21 @@ def build_detector(
                 "YuNet requested but not available. Ensure: (1) opencv-contrib-python installed, "
                 "(2) your OpenCV build exposes FaceDetectorYN, (3) --yunet-model points to a valid .onnx file."
             )
+        return det
+    if choice == "tinyface":
+        det = make_tinyface(
+            tinyface_checkpoint,
+            input_size=tinyface_input,
+            conf_th=tinyface_conf_thresh,
+            backbone=str(tinyface_backbone),
+            width_mult=float(tinyface_width_mult),
+            embed_dim=int(tinyface_embed_dim),
+            dropout=float(tinyface_dropout),
+            pretrained=bool(tinyface_pretrained),
+            fp16=fp16,
+        )
+        if det is None:
+            raise RuntimeError("TinyFace requested but not available (check pose.detectors.face_detector and dependencies)")
         return det
     if choice == "dlib":
         det = make_dlib()
@@ -505,104 +785,7 @@ def build_detector(
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--input-video", required=True)
-    parser.add_argument("--output-video", default=None)
-    parser.add_argument("--model-name", default="fan_2d")
-    parser.add_argument("--num-keypoints", type=int, default=68)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--input-size", type=int, default=256)
-    parser.add_argument(
-        "--config",
-        default="",
-        help="Optional YAML config (recommended for LOTR). If set, preprocessing size defaults to cfg.data.input_size.",
-    )
-    parser.add_argument(
-        "--override-input-size",
-        action="store_true",
-        help="In --config mode, force using --input-size instead of cfg.data.input_size for preprocessing.",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Use strict checkpoint loading (only applies when --config is set).",
-    )
-    parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around detected face box (training default)")
-
-    # If your input video is built from a COCO dataset (frames are the dataset images
-    # in the same order as COCO annotations), you can bypass detection entirely and
-    # use the dataset bbox for cropping. This matches training/val much closer.
-    parser.add_argument("--coco-json", default=None, help="Optional COCO json; if set, uses bboxes in annotation order per frame")
-    parser.add_argument("--detector", choices=["auto", "mtcnn", "yunet", "dlib", "composite", "haar"], default="auto")
-    parser.add_argument("--yunet-model", default=None, help="Path to YuNet ONNX model (required if --detector yunet)")
-    parser.add_argument("--yunet-score", type=float, default=0.4, help="YuNet score threshold")
-    parser.add_argument("--yunet-nms", type=float, default=0.3, help="YuNet NMS threshold")
-    parser.add_argument("--yunet-topk", type=int, default=5000, help="YuNet top_k")
-    parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--max-faces", type=int, default=4)
-    parser.add_argument("--skip-frames", type=int, default=1)
-    parser.add_argument("--draw-face-box", action="store_true")
-    parser.add_argument("--draw-crop-box", action="store_true", help="Draw the square crop box actually used for inference")
-    parser.add_argument(
-        "--draw-detected-landmarks",
-        dest="draw_detected_landmarks",
-        action="store_true",
-        help="Draw detected/predicted 2D landmarks",
-    )
-    parser.add_argument(
-        "--no-draw-detected-landmarks",
-        dest="draw_detected_landmarks",
-        action="store_false",
-        help="Do not draw detected/predicted 2D landmarks",
-    )
-    parser.set_defaults(draw_detected_landmarks=False)
-    # Default to 0 because training bbox-crop doesn't add arbitrary padding.
-    parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
-    parser.add_argument("--display", action="store_true", help="Show real-time preview window")
-    parser.add_argument(
-        "--show-input-crops",
-        action="store_true",
-        help="Show a debug window with the per-face 256x256 model inputs and landmarks overlaid",
-    )
-    parser.add_argument("--debug-crops-cols", type=int, default=4, help="Columns for the debug crops tiling window")
-    parser.add_argument("--model-3d-xml", default=None, help="Optional 3D landmark template XML; enables PnP + projection overlay")
-    parser.add_argument("--draw-pnp", action="store_true", help="Draw reprojected 3D landmarks (from solvePnP) over the frame")
-    parser.add_argument("--draw-axes", action="store_true", help="Draw pose axes (requires --model-3d-xml)")
-    parser.add_argument("--axes-len", type=float, default=0.05, help="Axes length in 3D units (same units as XML)")
-    parser.add_argument("--pnp-method", choices=["iterative", "epnp", "p3p", "ap3p"], default="iterative")
-    parser.add_argument(
-        "--pnp-max-reproj-err",
-        type=float,
-        default=8.0,
-        help="Discard PnP result if mean reprojection error (pixels) is above this threshold",
-    )
-    parser.add_argument("--cam-fx", type=float, default=None, help="Camera fx in pixels (default: derived)")
-    parser.add_argument("--cam-fy", type=float, default=None, help="Camera fy in pixels (default: derived)")
-    parser.add_argument("--cam-cx", type=float, default=None, help="Camera cx in pixels (default: W/2)")
-    parser.add_argument("--cam-cy", type=float, default=None, help="Camera cy in pixels (default: H/2)")
-    parser.add_argument("--cam-fov-deg", type=float, default=None, help="Optional horizontal FOV in degrees (used to estimate fx/fy)")
-    parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
-    parser.add_argument(
-        "--detect-every",
-        type=int,
-        default=1,
-        help="Run face detector every N processed frames; reuse last boxes in-between",
-    )
-    parser.add_argument(
-        "--detector-scale",
-        type=float,
-        default=1.0,
-        help="Downscale factor for face detection only (e.g. 0.5). Boxes are scaled back.",
-    )
-    parser.add_argument(
-        "--infer-every",
-        type=int,
-        default=1,
-        help="Run keypoint model every N processed frames; reuse last keypoints in-between",
-    )
-    parser.add_argument("--profile", action="store_true", help="Log per-stage timing breakdown")
-    parser.add_argument("--profile-every", type=int, default=60, help="Print timing every N processed frames")
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -696,6 +879,15 @@ def main():
         yunet_score_thresh=args.yunet_score,
         yunet_nms_thresh=args.yunet_nms,
         yunet_top_k=args.yunet_topk,
+        tinyface_checkpoint=args.tinyface_checkpoint,
+        tinyface_input=args.tinyface_input,
+        tinyface_conf_thresh=args.tinyface_conf,
+        tinyface_backbone=args.tinyface_backbone,
+        tinyface_width_mult=args.tinyface_width_mult,
+        tinyface_embed_dim=args.tinyface_embed_dim,
+        tinyface_dropout=args.tinyface_dropout,
+        tinyface_pretrained=(not bool(args.tinyface_no_pretrained)),
+        fp16=bool(args.fp16),
     )
 
     coco_bboxes = None
@@ -938,20 +1130,14 @@ def main():
                         last_kpts_frame = processed
 
                         if obj_pts_3d is not None:
-                            pnp_out = []
-                            for i in range(len(kpts_out)):
-                                sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
-                                if sol is None:
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": None})
-                                    continue
-                                rvec, tvec = sol
-                                proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
-                                err = _mean_reprojection_error(kpts_out[i], proj)
-                                if err > float(args.pnp_max_reproj_err):
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": float(err)})
-                                else:
-                                    pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj, "err": float(err)})
-                            last_pnp = pnp_out
+                            last_pnp = _run_pnp_batch(
+                                obj_pts_3d,
+                                kpts_out,
+                                K_cam,
+                                dist,
+                                method=str(args.pnp_method),
+                                max_reproj_err=float(args.pnp_max_reproj_err),
+                            )
                             last_pnp_frame = processed
                         if args.profile:
                             prof["decode_draw"] += perf_counter() - t1
@@ -997,20 +1183,14 @@ def main():
                         last_kpts_frame = processed
 
                         if obj_pts_3d is not None:
-                            pnp_out = []
-                            for i in range(len(kpts_out)):
-                                sol = _solve_pnp(obj_pts_3d, kpts_out[i], K_cam, dist, method=args.pnp_method)
-                                if sol is None:
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": None})
-                                    continue
-                                rvec, tvec = sol
-                                proj = _project_points(obj_pts_3d, rvec, tvec, K_cam, dist)
-                                err = _mean_reprojection_error(kpts_out[i], proj)
-                                if err > float(args.pnp_max_reproj_err):
-                                    pnp_out.append({"rvec": None, "tvec": None, "proj": None, "err": float(err)})
-                                else:
-                                    pnp_out.append({"rvec": rvec, "tvec": tvec, "proj": proj, "err": float(err)})
-                            last_pnp = pnp_out
+                            last_pnp = _run_pnp_batch(
+                                obj_pts_3d,
+                                kpts_out,
+                                K_cam,
+                                dist,
+                                method=str(args.pnp_method),
+                                max_reproj_err=float(args.pnp_max_reproj_err),
+                            )
                             last_pnp_frame = processed
 
                         if args.profile:
