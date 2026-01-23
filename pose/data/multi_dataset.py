@@ -47,8 +47,6 @@ class WeightedConcatDataset(Dataset):
         self.num_keypoints = getattr(ref, "num_keypoints", None)
         self.input_size = getattr(ref, "input_size", None)
         self.heatmap_size = getattr(ref, "heatmap_size", None)
-        self.depth_range = getattr(ref, "depth_range", None)
-        self.depth_mean = getattr(ref, "depth_mean", None)
 
         # sanity check: num_keypoints consistency when available
         for i, ds in enumerate(self.datasets[1:], start=1):

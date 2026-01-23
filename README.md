@@ -494,10 +494,10 @@ python scripts/infer.py --config configs/xreal_fan2d.yaml --checkpoint work_dirs
 python scripts/infer_video.py --config configs/xreal_fan2d.yaml --checkpoint work_dirs/xreal_fan2d/best.pth --input-video input.mp4 --fp16 --detector auto --output-video outputs/out.mp4
 ```
 
-If you have a 3D landmark template XML, you can enable a lightweight head-pose overlay (solvePnP):
+If you have a 3D template model XML, you can enable a lightweight head-pose overlay (solvePnP) using predicted 2D landmarks:
 
 ```bash
-python scripts/infer_video.py --config configs/xreal_fan3d.yaml --checkpoint work_dirs/xreal_fan3d/best.pth --input-video input.mp4 --model-3d-xml datasets/300W-xreal_air2_pyrender/_tmp_glasses_rgba/model.xml --draw-pnp --draw-axes
+python scripts/infer_video.py --config configs/xreal_fan2d.yaml --checkpoint work_dirs/xreal_fan2d/best.pth --input-video input.mp4 --model-3d-xml datasets/300W-xreal_air2_pyrender/_tmp_glasses_rgba/model.xml --draw-pnp --draw-axes
 ```
 
 ### E) BBox-only inference (TinyFace)

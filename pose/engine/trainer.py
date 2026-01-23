@@ -142,7 +142,7 @@ class Trainer:
         Expected dataset batch format (dict):
             - 'image'   : (B,3,H,W) float tensor, ImageNet-normalized
             - 'visible' : (B,K) visibility mask for keypoints (when applicable)
-            - 'heatmaps' / 'heatmaps_3d' : supervision targets for heatmap models
+            - 'heatmaps' : supervision targets for heatmap models
             - 'keypoints': (B,K,3) with (x,y,vis/score) in *input crop pixel space*
             - optional task-specific keys:
                 - 'bbox' (bbox detector)
@@ -174,13 +174,7 @@ class Trainer:
             base_kwargs["sigma"] = ds_cfg["sigma"]
 
 
-        # Pass optional 3D-related kwargs if the dataset supports them
-        if "depth_bins" in ds_cfg:
-            base_kwargs["depth_bins"] = ds_cfg["depth_bins"]
 
-        # Allow optional depth_range passthrough.
-        if "depth_range" in ds_cfg:
-            base_kwargs["depth_range"] = tuple(ds_cfg["depth_range"]) if ds_cfg["depth_range"] is not None else None
 
         # Multi-dataset training (optional)
         #
@@ -224,10 +218,6 @@ class Trainer:
                     ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
                 if "sigma" in item:
                     ds_kwargs["sigma"] = item["sigma"]
-                if "depth_bins" in item:
-                    ds_kwargs["depth_bins"] = item["depth_bins"]
-                if "depth_range" in item:
-                    ds_kwargs["depth_range"] = tuple(item["depth_range"]) if item["depth_range"] is not None else None
 
                 ds = DatasetCls(json_path=train_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
@@ -293,10 +283,6 @@ class Trainer:
                     ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
                 if "sigma" in item:
                     ds_kwargs["sigma"] = item["sigma"]
-                if "depth_bins" in item:
-                    ds_kwargs["depth_bins"] = item["depth_bins"]
-                if "depth_range" in item:
-                    ds_kwargs["depth_range"] = tuple(item["depth_range"]) if item["depth_range"] is not None else None
 
                 ds = DatasetCls(json_path=val_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
@@ -394,12 +380,6 @@ class Trainer:
                 continue
             model_kwargs[k] = v
 
-        # Provide dataset depth range to the model so z is in the same units as annotations
-        if hasattr(self.train_ds, "depth_range") and self.train_ds.depth_range is not None:
-            model_kwargs["depth_range"] = self.train_ds.depth_range
-        if hasattr(self.train_ds, "depth_mean") and self.train_ds.depth_mean is not None:
-            model_kwargs["depth_mean"] = self.train_ds.depth_mean
-
         # Only pass kwargs that the model constructor actually accepts.
         # Some registered classes (e.g. detector heads) do not accept
         # `num_keypoints` or other pose-specific kwargs; guard against
@@ -428,10 +408,6 @@ class Trainer:
         loss_kwargs = {k: v for k, v in loss_cfg.items() if k != "name"}
         self.criterion = LossCls(**loss_kwargs).to(self.device)
 
-        # auxiliary 2D MSE for spatial heatmap supervision when using 3D volumetric loss
-        self._mse2d = torch.nn.MSELoss(reduction="mean")
-        # weight for 2D auxiliary loss (can be overridden in config)
-        self.aux_2d_weight = cfg.get("loss", {}).get("aux_2d_weight", 1.0)
 
         # Optimizer
         train_cfg = cfg["train"]
@@ -706,44 +682,22 @@ class Trainer:
                     loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
 
                 else:
-                    # Heatmap-based training (existing behaviour)
-                    if loss_name == "heatmap_3d_mse":
-                        targets = batch["heatmaps_3d"].to(self.device)
-                    else:
-                        targets = batch["heatmaps"].to(self.device)
-
+                    # Heatmap-based training
+                    targets = batch["heatmaps"].to(self.device)
                     visible = batch["visible"].to(self.device)
-                    depth_targets = batch.get("depth", None)
-                    if depth_targets is not None:
-                        depth_targets = depth_targets.to(self.device)
-
                     out = self.model(imgs)
-                    # FAN3D returns: last_heatmap, all_heatmaps, last_depth, all_depths
-                    if isinstance(out, tuple) and len(out) == 4:
-                        preds_last, preds_all, depth_last, depth_all = out
-                        loss = 0.0
-                        for i in range(len(preds_all)):
-                            p = preds_all[i]
-                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-                            if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                                d = depth_all[i]
-                                loss += self.depth_criterion(d, depth_targets)
-                    else:
+                    if isinstance(out, tuple) and len(out) == 2:
                         preds_last, preds_all = out
-                        loss = 0.0
+                    else:
+                        preds_last = out
+                        preds_all = [out]
+
+                    loss = 0.0
+                    if isinstance(preds_all, (list, tuple)):
                         for p in preds_all:
                             loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-
-                        if loss_name == "heatmap_3d_mse":
-                            hm_targets = batch["heatmaps"].to(self.device)
-                            if sample_weight is None:
-                                aux_loss = self._mse2d(preds_last, hm_targets)
-                            else:
-                                err2d = (preds_last - hm_targets) ** 2
-                                per_sample = err2d.view(err2d.size(0), -1).mean(dim=1)
-                                sw = sample_weight.to(dtype=per_sample.dtype).view(-1)
-                                aux_loss = (per_sample * sw).sum() / sw.sum().clamp(min=1e-6)
-                            loss = loss + self.aux_2d_weight * aux_loss
+                    else:
+                        loss = self.criterion(preds_all, targets, visible, sample_weight=sample_weight)
 
             # Backward + step
             if self.use_amp and self.device.type == "cuda" and self.scaler.is_enabled():
@@ -877,31 +831,22 @@ class Trainer:
                         coord_targets.append(targets_2d[b].cpu().numpy())
 
                 else:
-                    if loss_name == "heatmap_3d_mse":
-                        targets = batch["heatmaps_3d"].to(self.device)
-                    else:
-                        targets = batch["heatmaps"].to(self.device)
+                    targets = batch["heatmaps"].to(self.device)
 
                     visible = batch["visible"].to(self.device)
-                    depth_targets = batch.get("depth", None)
-                    if depth_targets is not None:
-                        depth_targets = depth_targets.to(self.device)
-
                     out = self.model(imgs)
-                    if isinstance(out, tuple) and len(out) == 4:
-                        preds_last, preds_all, depth_last, depth_all = out
-                        loss = 0.0
-                        for i in range(len(preds_all)):
-                            p = preds_all[i]
-                            loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
-                            if depth_targets is not None and hasattr(self, 'depth_criterion'):
-                                d = depth_all[i]
-                                loss += self.depth_criterion(d, depth_targets)
-                    else:
+                    if isinstance(out, tuple) and len(out) == 2:
                         preds_last, preds_all = out
-                        loss = 0.0
+                    else:
+                        preds_last = out
+                        preds_all = [out]
+
+                    loss = 0.0
+                    if isinstance(preds_all, (list, tuple)):
                         for p in preds_all:
                             loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
+                    else:
+                        loss = self.criterion(preds_all, targets, visible, sample_weight=sample_weight)
 
                 if (
                     preds_last is not None

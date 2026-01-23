@@ -90,12 +90,13 @@ class Hourglass(nn.Module):
 
 @register_model("stacked_hourglass")
 class StackedHourglass(PoseModel):
-        """Stacked hourglass model producing K heatmaps.
+    """Stacked hourglass model producing K heatmaps.
 
-        Forward returns:
-            - pred_last: (B, K, Hh, Wh)
-            - preds_all: list[(B, K, Hh, Wh)] with length = num_stacks
-        """
+    Forward returns:
+        - pred_last: (B, K, Hh, Wh)
+        - preds_all: list[(B, K, Hh, Wh)] with length = num_stacks
+    """
+
     def __init__(
         self,
         num_stacks: int,
