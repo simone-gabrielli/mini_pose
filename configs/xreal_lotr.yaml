@@ -35,7 +35,6 @@ data:
       weight: 0.2
 
   input_size: [256, 256]      # Standard input size for LOTR
-  heatmap_size: [64, 64]      # Not used for coordinate regression, but kept for compatibility
   batch_size: 16
   num_workers: 4
   aug:

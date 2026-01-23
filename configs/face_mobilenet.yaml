@@ -18,7 +18,6 @@ data:
       weight: 0.2
       
   input_size: [256, 256]
-  heatmap_size: [64, 64]
   batch_size: 32
   # Windows tends to be more stable with num_workers=0 unless you really need speed.
   num_workers: 0

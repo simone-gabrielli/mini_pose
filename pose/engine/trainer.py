@@ -157,10 +157,16 @@ class Trainer:
         # Dataset
         ds_cfg = cfg["data"]
         DatasetCls = DATASET_REGISTRY[ds_cfg["type"]]
-        base_kwargs = dict(
-            input_size=tuple(ds_cfg["input_size"]),
-            heatmap_size=tuple(ds_cfg["heatmap_size"]),
-        )
+        if "input_size" not in ds_cfg:
+            raise KeyError("Config is missing required key: data.input_size")
+
+        # Only pass dataset kwargs that are explicitly specified.
+        # Most datasets have sensible defaults for things like heatmap_size/sigma.
+        base_kwargs: dict[str, Any] = {
+            "input_size": tuple(ds_cfg["input_size"]),
+        }
+        if "heatmap_size" in ds_cfg:
+            base_kwargs["heatmap_size"] = tuple(ds_cfg["heatmap_size"])
 
         # Optional: forward sigma from config into dataset so GT heatmaps
         # are generated at the requested spatial resolution with matching sigma.
@@ -171,6 +177,10 @@ class Trainer:
         # Pass optional 3D-related kwargs if the dataset supports them
         if "depth_bins" in ds_cfg:
             base_kwargs["depth_bins"] = ds_cfg["depth_bins"]
+
+        # Allow optional depth_range passthrough.
+        if "depth_range" in ds_cfg:
+            base_kwargs["depth_range"] = tuple(ds_cfg["depth_range"]) if ds_cfg["depth_range"] is not None else None
 
         # Multi-dataset training (optional)
         #
@@ -205,12 +215,21 @@ class Trainer:
 
                 aug_cfg = item.get("aug", ds_cfg.get("aug", None))
 
-                ds = DatasetCls(
-                    json_path=train_json,
-                    image_root=image_root,
-                    aug_cfg=aug_cfg,
-                    **base_kwargs,
-                )
+                # Per-dataset overrides (optional). This lets you omit keys at the
+                # top-level and only specify them where they matter.
+                ds_kwargs = dict(base_kwargs)
+                if "input_size" in item:
+                    ds_kwargs["input_size"] = tuple(item["input_size"])
+                if "heatmap_size" in item:
+                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
+                if "sigma" in item:
+                    ds_kwargs["sigma"] = item["sigma"]
+                if "depth_bins" in item:
+                    ds_kwargs["depth_bins"] = item["depth_bins"]
+                if "depth_range" in item:
+                    ds_kwargs["depth_range"] = tuple(item["depth_range"]) if item["depth_range"] is not None else None
+
+                ds = DatasetCls(json_path=train_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
                 loss_weight = float(item.get("loss_weight", 1.0))
                 name = item.get("name")
@@ -267,12 +286,19 @@ class Trainer:
 
                 aug_cfg = item.get("val_aug", item.get("aug", ds_cfg.get("val_aug", ds_cfg.get("aug", None))))
 
-                ds = DatasetCls(
-                    json_path=val_json,
-                    image_root=image_root,
-                    aug_cfg=aug_cfg,
-                    **base_kwargs,
-                )
+                ds_kwargs = dict(base_kwargs)
+                if "input_size" in item:
+                    ds_kwargs["input_size"] = tuple(item["input_size"])
+                if "heatmap_size" in item:
+                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
+                if "sigma" in item:
+                    ds_kwargs["sigma"] = item["sigma"]
+                if "depth_bins" in item:
+                    ds_kwargs["depth_bins"] = item["depth_bins"]
+                if "depth_range" in item:
+                    ds_kwargs["depth_range"] = tuple(item["depth_range"]) if item["depth_range"] is not None else None
+
+                ds = DatasetCls(json_path=val_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
                 # allow either `weight` or `loss_weight` for convenience
                 w = item.get("weight", item.get("loss_weight", 1.0))
@@ -877,7 +903,13 @@ class Trainer:
                         for p in preds_all:
                             loss += self.criterion(p, targets, visible, sample_weight=sample_weight)
 
-                if preds_last is not None and isinstance(preds_last, torch.Tensor) and preds_last.dim() == 4:
+                if (
+                    preds_last is not None
+                    and isinstance(preds_last, torch.Tensor)
+                    and preds_last.dim() == 4
+                    and hasattr(dataset, "heatmap_size")
+                    and dataset.heatmap_size is not None
+                ):
                     # image and heatmap sizes from the *validation* dataset
                     H_img, W_img = dataset.input_size[1], dataset.input_size[0]
                     H_hm, W_hm = dataset.heatmap_size[1], dataset.heatmap_size[0]

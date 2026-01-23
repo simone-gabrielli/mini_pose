@@ -33,7 +33,6 @@ data:
       weight: 0.2
 
   input_size: [192, 192]      # Smaller input for speed
-  heatmap_size: [48, 48]
   batch_size: 16              # Larger batch size due to smaller model
   num_workers: 4
   aug:

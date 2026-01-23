@@ -10,7 +10,6 @@ data:
   val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-3D/annotations/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-3D/"
   input_size: [256, 256]
-  heatmap_size: [64, 64]
   batch_size: 16               # Smaller batch for ResNet50
   num_workers: 4
   aug:
