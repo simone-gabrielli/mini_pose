@@ -4,25 +4,35 @@ seed: 1337
 data:
   type: coco_face
   train_datasets:
+    - name: hmd_xreal
+      train_json: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      loss_weight: 1.0
 
     - name: 300w_xreal_air2
       train_json: "datasets/300W-xreal_air2/annotations/train.json"
       image_root: "datasets/300W-xreal_air2"
       loss_weight: 0.4
+
   # Multi-dataset validation.
-  primary_val: 300w_xreal_air2
+  primary_val: hmd_xreal
   val_datasets:
+    - name: hmd_xreal
+      val_json: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
     - name: 300w_xreal_air2
       val_json: "datasets/300W-xreal_air2/annotations/val.json"
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
       
-  input_size: [256, 256]
+  input_size: [192, 192]
   batch_size: 32
   # Windows tends to be more stable with num_workers=0 unless you really need speed.
   num_workers: 0
   aug:
-    use_bbox_crop: true
+    use_bbox_crop: false
     face_margin: 0.25
     hflip_p: 0.5
     rotation: 10

@@ -1,0 +1,8 @@
+Infer:
+python .\infer.py --config ..\configs\xreal_lotr_light.yaml --checkpoint ..\work_dirs\xreal_lotr_light\best.pth --model-name lotr_light --coco-json ..\datasets\300W-xreal_air2\annotations\val.json --images-root ..\datasets\300W-xreal_air2\ --sample-percent 20 --out-dir .\infer_out\ --draw-bbo
+
+Infer Video:
+python .\infer_video.py --checkpoint ..\work_dirs\xreal_lotr_light\best.pth --input-video "C:\Users\simog\hmdrive\head_tracking\mini_pose\scripts\video_test\test_kpts_detection_1.mp4" --model-name lotr_light --detector yunet --yunet-model .\yunet_detector\face_detection_yunet_2023mar.onnx --box-pad 35 --max-faces 1 --display --draw-face-box --detector-scale 0.5 --detect-every 1 --infer-every 1 --fp16 --profile --profile-every 60 --show-input-crops --override-input-size --input-size 192 --model-3d-xml ..\..\dlib_custom\data\glasses_models\xreal_one_68_v3.xml --draw-pnp --draw-axes --tinyface-checkpoint ..\work_dirs\face_mobilenet\best.pth
+
+Infer BBox:
+python infer_bbox.py --config ..\configs\face_mobilenet.yaml --checkpoint ..\work_dirs\face_mobilenet\best.pth --dataset ..\datasets\hmd_xreal\annotations\ --images-root ..\datasets\hmd_xreal\images\ --split val --out-dir outputs/infer_bbox --max-samples 200 --draw-gt --conf-th 0.3

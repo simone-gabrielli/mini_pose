@@ -851,13 +851,13 @@ def main():
     out_path = args.output_video
     if out_path is None:
         base, _ = os.path.splitext(os.path.basename(input_path))
-        out_path = f"{base}_landmarks.mp4"
+        out_path = f"outputs/{base}_landmarks.mp4"
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {input_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
