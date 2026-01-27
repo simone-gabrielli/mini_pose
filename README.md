@@ -411,20 +411,30 @@ loss:
 
 train:
   epochs: 50
-  lr: 0.00025
-  weight_decay: 0.0001
-  optimizer: adam
-  lr_steps: [30, 40]
-  lr_gamma: 0.1
+  optimizer:
+    name: adam
+    lr: 0.00025
+    weight_decay: 0.0001
+  scheduler:
+    name: multistep
+    milestones: [30, 40]
+    gamma: 0.1
   output_dir: "work_dirs/example_hourglass"
 
+  # Optional: qualitative visualizations (if model implements generate_sample_visualization)
+  # num_val_viz: 4
+
   # --- Optional regularization bundle ---
-  # Optimizer + schedule
-  # optimizer: adamw
-  # lr_schedule: cosine_warmup
-  # warmup_epochs: 5
-  # warmup_start_factor: 0.1
-  # min_lr: 0.0
+  # Optimizer + schedule (cosine with warmup)
+  # optimizer:
+  #   name: adamw
+  #   lr: 0.00025
+  #   weight_decay: 0.0001
+  # scheduler:
+  #   name: cosine_warmup
+  #   warmup_epochs: 5
+  #   warmup_start_factor: 0.1
+  #   min_lr: 0.0
 
   # Training stability
   # grad_clip_norm: 1.0

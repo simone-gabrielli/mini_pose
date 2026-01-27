@@ -350,12 +350,28 @@ class Trainer:
         self.criterion = LossCls(**loss_kwargs).to(self.device)
 
 
-        # Optimizer
+        # Optimizer / Scheduler
+        #
+        # Standard schema (preferred):
+        #   train:
+        #     optimizer: {name, lr, weight_decay?, betas?}
+        #     scheduler: {name, ...}
+        #
+        # Legacy fallback (still accepted):
+        #   train: {optimizer, lr, weight_decay, betas, lr_schedule, lr_steps, lr_gamma, ...}
         train_cfg = cfg["train"]
-        opt_name = str(train_cfg.get("optimizer", "adam")).lower()
-        lr = float(train_cfg["lr"])
-        weight_decay = float(train_cfg.get("weight_decay", 0.0))
-        betas = tuple(train_cfg.get("betas", [0.9, 0.999]))
+
+        opt_cfg = train_cfg.get("optimizer", {})
+        if isinstance(opt_cfg, dict):
+            opt_name = str(opt_cfg.get("name", "adam")).lower()
+            lr = float(opt_cfg.get("lr", train_cfg.get("lr")))
+            weight_decay = float(opt_cfg.get("weight_decay", train_cfg.get("weight_decay", 0.0)))
+            betas = tuple(opt_cfg.get("betas", train_cfg.get("betas", [0.9, 0.999])))
+        else:
+            opt_name = str(opt_cfg or train_cfg.get("optimizer", "adam")).lower()
+            lr = float(train_cfg["lr"])
+            weight_decay = float(train_cfg.get("weight_decay", 0.0))
+            betas = tuple(train_cfg.get("betas", [0.9, 0.999]))
 
         if opt_name == "adam":
             self.optimizer = torch.optim.Adam(
@@ -374,18 +390,39 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported optimizer: {opt_name}")
 
-        # Scheduler (backward compatible default: MultiStepLR)
-        sched_name = str(train_cfg.get("lr_schedule", "multistep")).lower()
+        sched_cfg = train_cfg.get("scheduler", {})
+        if isinstance(sched_cfg, dict) and sched_cfg:
+            sched_name = str(sched_cfg.get("name", "multistep")).lower()
+        else:
+            sched_name = str(train_cfg.get("lr_schedule", "multistep")).lower()
+
         if sched_name == "multistep":
+            if isinstance(sched_cfg, dict) and sched_cfg:
+                milestones = sched_cfg.get("milestones", sched_cfg.get("lr_steps", [30, 50]))
+                gamma = sched_cfg.get("gamma", sched_cfg.get("lr_gamma", 0.1))
+            else:
+                milestones = train_cfg.get("lr_steps", [30, 50])
+                gamma = train_cfg.get("lr_gamma", 0.1)
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer,
-                milestones=train_cfg.get("lr_steps", [30, 50]),
-                gamma=train_cfg.get("lr_gamma", 0.1),
+                milestones=milestones,
+                gamma=gamma,
             )
         elif sched_name in ("cosine_warmup", "cosine", "cosine_with_warmup"):
-            warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
-            min_lr = float(train_cfg.get("min_lr", 0.0))
-            warmup_start_factor = float(train_cfg.get("warmup_start_factor", 0.1))
+            if isinstance(sched_cfg, dict) and sched_cfg:
+                warmup_epochs = int(sched_cfg.get("warmup_epochs", train_cfg.get("warmup_epochs", 5)))
+                min_lr = float(sched_cfg.get("min_lr", train_cfg.get("min_lr", 0.0)))
+                warmup_start_factor = float(
+                    sched_cfg.get("warmup_start_factor", train_cfg.get("warmup_start_factor", 0.1))
+                )
+            else:
+                warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
+                min_lr = float(train_cfg.get("min_lr", 0.0))
+                warmup_start_factor = float(train_cfg.get("warmup_start_factor", 0.1))
+
+            # If user selected explicit cosine_warmup, force at least 1 warmup epoch.
+            if sched_name == "cosine_warmup":
+                warmup_epochs = max(1, warmup_epochs)
             if warmup_epochs < 0:
                 warmup_epochs = 0
             if warmup_start_factor <= 0:

@@ -94,15 +94,14 @@ loss:
 
 train:
   epochs: 80
-  lr: 0.0005
-  weight_decay: 0.0001
-  optimizer: adam
-  lr_schedule: multistep
-  lr_steps: [40, 50]
-  lr_gamma: 0.1
-  warmup_epochs: 5
-  warmup_start_factor: 0.1
-  min_lr: 0.0
+  optimizer:
+    name: adam
+    lr: 0.0005
+    weight_decay: 0.0001
+  scheduler:
+    name: multistep
+    milestones: [40, 50]
+    gamma: 0.1
   grad_clip_norm: 0.0
   amp:
     enabled: false
@@ -112,4 +111,5 @@ train:
     decay: 0.999
     update_every: 1
     eval: true
+  num_val_viz: 4
   output_dir: "work_dirs/xreal_fan_hmd_plus_air2"
