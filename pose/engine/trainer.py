@@ -175,182 +175,124 @@ class Trainer:
             base_kwargs["sigma"] = ds_cfg["sigma"]
 
 
-        # Multi-dataset training (optional)
+        # Standardized multi-dataset config
         #
-        # Backward-compatible (single dataset):
-        #   data: { train_json, val_json, image_root, ... }
-        # Multi-dataset (train only):
-        #   data:
-        #     train_datasets:
-        #       - name: hmd_xreal
-        #         train_json: ...
-        #         image_root: ...
-        #         loss_weight: 1.0
-        #       - name: air2
-        #         train_json: ...
-        #         image_root: ...
-        #         loss_weight: 0.5
-        #     val_json: ...
-        #     val_image_root: ...
-        train_specs = []
-        if isinstance(ds_cfg.get("train_datasets"), list) and len(ds_cfg.get("train_datasets")) > 0:
-            for item in ds_cfg["train_datasets"]:
-                if not isinstance(item, dict):
-                    raise ValueError("Each entry in data.train_datasets must be a dict")
+        # data:
+        #   train_datasets:
+        #     - name: hmd_xreal
+        #       json_path: datasets/hmd_xreal/annotations/train.json
+        #       image_root: datasets/hmd_xreal/images
+        #       weight: 1.0
+        #   val_datasets:
+        #     - name: hmd_xreal
+        #       json_path: datasets/hmd_xreal/annotations/val.json
+        #       image_root: datasets/hmd_xreal/images
+        #       weight: 1.0
+        #   primary_val: hmd_xreal
 
-                train_json = item.get("train_json") or item.get("json_path")
-                if not isinstance(train_json, str):
-                    raise ValueError("Each train dataset must provide train_json (or json_path) as a string")
+        train_items = ds_cfg.get("train_datasets")
+        if not isinstance(train_items, list) or len(train_items) == 0:
+            raise KeyError("Config is missing required key: data.train_datasets (non-empty list)")
 
-                image_root = item.get("image_root")
-                if not isinstance(image_root, str):
-                    raise ValueError("Each train dataset must provide image_root as a string")
+        train_specs: list[DatasetSpec] = []
+        for i, item in enumerate(train_items):
+            if not isinstance(item, dict):
+                raise ValueError("Each entry in data.train_datasets must be a dict")
 
-                aug_cfg = item.get("aug", ds_cfg.get("aug", None))
+            json_path = item.get("json_path")
+            if not isinstance(json_path, str) or not json_path:
+                raise ValueError("Each train dataset must provide json_path as a non-empty string")
 
-                # Per-dataset overrides (optional). This lets you omit keys at the
-                # top-level and only specify them where they matter.
-                ds_kwargs = dict(base_kwargs)
-                ds_kwargs["input_size"] = tuple(item["input_size"]) # Required
-                if "heatmap_size" in item:
-                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"]) # Optional
-                if "sigma" in item:
-                    ds_kwargs["sigma"] = item["sigma"] # Optional
+            image_root = item.get("image_root")
+            if not isinstance(image_root, str) or not image_root:
+                raise ValueError("Each train dataset must provide image_root as a non-empty string")
 
-                ds = DatasetCls(json_path=train_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
+            aug_cfg = item.get("aug", ds_cfg.get("aug", None))
 
-                loss_weight = float(item.get("loss_weight", 1.0))
-                name = item.get("name")
-                train_specs.append(DatasetSpec(dataset=ds, loss_weight=loss_weight, name=name))
+            # Per-dataset overrides (optional).
+            ds_kwargs = dict(base_kwargs)
+            if "input_size" in item:
+                ds_kwargs["input_size"] = tuple(item["input_size"])
+            if "heatmap_size" in item:
+                ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
+            if "sigma" in item:
+                ds_kwargs["sigma"] = item["sigma"]
 
-            self.train_ds = WeightedConcatDataset(train_specs)
-        else:
-            # single dataset
-            self.train_ds = DatasetCls(
-                json_path=ds_cfg["train_json"],
-                image_root=ds_cfg["image_root"],
-                aug_cfg=ds_cfg.get("aug", None),
-                **base_kwargs,
-            )
+            ds = DatasetCls(json_path=json_path, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
-        # Validation dataset(s)
-        #
-        # Backward-compatible (single val dataset):
-        #   data: { val_json, val_image_root?, ... }
-        # Multi-dataset validation:
-        #   data:
-        #     val_datasets:
-        #       - name: air2
-        #         val_json: ...
-        #         image_root: ...
-        #         weight: 1.0
-        #       - name: hmd
-        #         val_json: ...
-        #         image_root: ...
-        #         weight: 1.0
-        #     primary_val: air2
+            w = float(item.get("weight", 1.0))
+            if w < 0:
+                raise ValueError("Train dataset weight must be >= 0")
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                name = f"train{i}"
+            train_specs.append(DatasetSpec(dataset=ds, loss_weight=w, name=name))
+
+        self.train_ds = WeightedConcatDataset(train_specs)
+
+        val_items = ds_cfg.get("val_datasets")
+        if not isinstance(val_items, list) or len(val_items) == 0:
+            raise KeyError("Config is missing required key: data.val_datasets (non-empty list)")
+
         self.val_loaders: dict[str, DataLoader] = {}
         self.val_datasets: dict[str, Any] = {}
         self.val_weights: dict[str, float] = {}
-        self.primary_val_name: str = "val"
 
-        if isinstance(ds_cfg.get("val_datasets"), list) and len(ds_cfg.get("val_datasets")) > 0:
-            primary = ds_cfg.get("primary_val")
-            for i, item in enumerate(ds_cfg["val_datasets"]):
-                if not isinstance(item, dict):
-                    raise ValueError("Each entry in data.val_datasets must be a dict")
+        primary = ds_cfg.get("primary_val")
+        for i, item in enumerate(val_items):
+            if not isinstance(item, dict):
+                raise ValueError("Each entry in data.val_datasets must be a dict")
 
-                name = item.get("name")
-                if not isinstance(name, str) or not name:
-                    name = f"val{i}"
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                name = f"val{i}"
 
-                val_json = item.get("val_json") or item.get("json_path")
-                if not isinstance(val_json, str):
-                    raise ValueError("Each val dataset must provide val_json (or json_path) as a string")
+            json_path = item.get("json_path")
+            if not isinstance(json_path, str) or not json_path:
+                raise ValueError("Each val dataset must provide json_path as a non-empty string")
 
-                image_root = item.get("val_image_root") or item.get("image_root")
-                if not isinstance(image_root, str):
-                    raise ValueError("Each val dataset must provide image_root (or val_image_root) as a string")
+            image_root = item.get("image_root")
+            if not isinstance(image_root, str) or not image_root:
+                raise ValueError("Each val dataset must provide image_root as a non-empty string")
 
-                aug_cfg = item.get("val_aug", item.get("aug", ds_cfg.get("val_aug", ds_cfg.get("aug", None))))
+            aug_cfg = item.get("aug", ds_cfg.get("aug", None))
 
-                ds_kwargs = dict(base_kwargs)
-                if "input_size" in item:
-                    ds_kwargs["input_size"] = tuple(item["input_size"])
-                if "heatmap_size" in item:
-                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
-                if "sigma" in item:
-                    ds_kwargs["sigma"] = item["sigma"]
+            ds_kwargs = dict(base_kwargs)
+            if "input_size" in item:
+                ds_kwargs["input_size"] = tuple(item["input_size"])
+            if "heatmap_size" in item:
+                ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
+            if "sigma" in item:
+                ds_kwargs["sigma"] = item["sigma"]
 
-                ds = DatasetCls(json_path=val_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
+            ds = DatasetCls(json_path=json_path, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
-                # allow either `weight` or `loss_weight` for convenience
-                w = item.get("weight", item.get("loss_weight", 1.0))
-                w = float(w)
-                if w < 0:
-                    raise ValueError("Validation dataset weight must be >= 0")
+            w = float(item.get("weight", 1.0))
+            if w < 0:
+                raise ValueError("Validation dataset weight must be >= 0")
 
-                bs = int(item.get("batch_size", ds_cfg.get("val_batch_size", ds_cfg["batch_size"])))
-                if bs < 1:
-                    raise ValueError("Validation batch_size must be >= 1")
-
-                num_workers = ds_cfg.get("num_workers", 0)
-                loader = DataLoader(
-                    ds,
-                    batch_size=bs,
-                    shuffle=False,
-                    num_workers=num_workers,
-                    pin_memory=True,
-                    persistent_workers=(num_workers > 0),
-                )
-
-                self.val_datasets[name] = ds
-                self.val_loaders[name] = loader
-                self.val_weights[name] = w
-
-            if isinstance(primary, str) and primary in self.val_loaders:
-                self.primary_val_name = primary
-            else:
-                # default to the first entry
-                self.primary_val_name = next(iter(self.val_loaders.keys()))
-
-            # Keep legacy attributes pointing at the primary val set.
-            self.val_ds = self.val_datasets[self.primary_val_name]
-            self.val_loader = self.val_loaders[self.primary_val_name]
-        else:
-            # single dataset (current behavior)
-            val_json = ds_cfg["val_json"]
-            val_image_root = ds_cfg.get("val_image_root")
-            if val_image_root is None:
-                # fall back to legacy key, or the first train dataset's root
-                val_image_root = ds_cfg.get("image_root")
-                if val_image_root is None and train_specs:
-                    val_image_root = getattr(train_specs[0].dataset, "image_root", None)
-            if not isinstance(val_image_root, str):
-                raise ValueError(
-                    "Validation requires data.val_image_root (or data.image_root for single-dataset configs)."
-                )
-
-            self.val_ds = DatasetCls(
-                json_path=val_json,
-                image_root=val_image_root,
-                aug_cfg=ds_cfg.get("val_aug", ds_cfg.get("aug", None)),
-                **base_kwargs,
-            )
+            bs = int(item.get("batch_size", ds_cfg.get("val_batch_size", ds_cfg["batch_size"])))
+            if bs < 1:
+                raise ValueError("Validation batch_size must be >= 1")
 
             num_workers = ds_cfg.get("num_workers", 0)
-            self.val_loader = DataLoader(
-                self.val_ds,
-                batch_size=int(ds_cfg.get("val_batch_size", ds_cfg["batch_size"])),
+            loader = DataLoader(
+                ds,
+                batch_size=bs,
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=(num_workers > 0),
             )
-            self.val_datasets = {"val": self.val_ds}
-            self.val_loaders = {"val": self.val_loader}
-            self.val_weights = {"val": 1.0}
-            self.primary_val_name = "val"
+
+            self.val_datasets[name] = ds
+            self.val_loaders[name] = loader
+            self.val_weights[name] = w
+
+        if isinstance(primary, str) and primary in self.val_loaders:
+            self.primary_val_name = primary
+        else:
+            self.primary_val_name = next(iter(self.val_loaders.keys()))
 
         num_workers = ds_cfg.get("num_workers", 0)
         self.train_loader = DataLoader(
@@ -361,7 +303,8 @@ class Trainer:
             pin_memory=True,
             persistent_workers=(num_workers > 0),
         )
-        # self.val_loader is created above (single or multi-dataset)
+
+        # val loaders are created above (multi-dataset only)
 
         num_keypoints = self.train_ds.num_keypoints
 
@@ -523,66 +466,6 @@ class Trainer:
         # generic history: split -> metric_name -> list[float]
         self.history = {"train": {}, "val": {}}
         self.start_epoch = 1  # default
-
-    def _visualize_model_outputs(self, sample, out_path: str):
-        # Runs forward pass and saves overlay images with predicted heatmaps
-        self.model.eval()
-        imgs = sample["image"].unsqueeze(0).to(self.device)
-        keypts_gt = sample["keypoints"].cpu().numpy()
-
-        with torch.no_grad():
-            out = self.model(imgs)
-
-        # prefer the model's primary output (out[0]) if present (2D heatmaps),
-        # otherwise fall back to preds_all[-1]
-        if isinstance(out, tuple):
-            if isinstance(out[0], torch.Tensor):
-                preds_last = out[0]
-            else:
-                preds_last = out[1][-1]
-        else:
-            preds_last = out
-
-        hm = preds_last[0].cpu().numpy()  # shape (K, H_hm, W_hm)
-        img_np = sample["image"].cpu().numpy().transpose(1,2,0)
-
-        # Undo dataset normalization (ImageNet mean/std used in pipeline)
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        try:
-            img_np = (img_np * std) + mean
-        except Exception:
-            pass
-
-        H_img, W_img = img_np.shape[0], img_np.shape[1]
-        H_hm, W_hm = hm.shape[1], hm.shape[2]
-        scale_x = W_img / W_hm
-        scale_y = H_img / H_hm
-
-        plt.figure(figsize=(4,4))
-        plt.imshow(img_np)
-        for k in range(hm.shape[0]):
-            hm_k = hm[k]
-            hm_k = hm_k / hm_k.max() if hm_k.max() > 0 else hm_k
-            hm_resized = plt.cm.jet(hm_k)
-            plt.imshow(hm_resized[..., :3], alpha=0.3)
-        xs = keypts_gt[:,0]
-        ys = keypts_gt[:,1]
-        plt.scatter(xs, ys, c='lime', s=5, label='gt')
-        # Predicted points:
-        coords_pred = []
-        for k in range(hm.shape[0]):
-            idx_flat = hm[k].reshape(-1).argmax()
-            y = idx_flat // W_hm
-            x = idx_flat % W_hm
-            coords_pred.append((x*scale_x, y*scale_y))
-        coords_pred = np.array(coords_pred)
-        plt.scatter(coords_pred[:,0], coords_pred[:,1], c='red', s=5, label='pred')
-        plt.legend(loc='upper right', fontsize=6)
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=150)
-        plt.close()
 
     def log_metric(self, split: str, name: str, value: float):
         """Log any scalar metric for train/val in a generic way."""
@@ -1036,15 +919,6 @@ class Trainer:
 
         if not getattr(self, "val_datasets", None):
             return
-
-        # for i in range(num_vis):
-        #     sample = self.val_ds[i]
-        #     out_path = os.path.join(self.output_dir, "viz", f"val_example_{i}.png")
-        #     if hasattr(self.model, "generate_sample_visualization"):
-        #         generate_fn = self.model.generate_sample_visualization
-        #         generate_fn(sample, out_path, self.device)
-        #     else:
-        #         self._visualize_model_outputs(sample, out_path)
 
         self.model.eval()
         viz_root = os.path.join(self.output_dir, "viz")

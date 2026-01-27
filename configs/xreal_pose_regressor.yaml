@@ -13,9 +13,18 @@ data:
   type: coco_keypoints
   input_size: [256, 256]
 
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
-  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
+  train_datasets:
+    - name: hmd_xreal_v3
+      json_path: "datasets/hmd_xreal/annotations_v3/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+  primary_val: hmd_xreal_v3
+  val_datasets:
+    - name: hmd_xreal_v3
+      json_path: "datasets/hmd_xreal/annotations_v3/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
   
   batch_size: 32
   num_workers: 0
@@ -76,7 +85,7 @@ model:
   fy: 700.69
   cx: 632.93
   cy: 345.93
-  cad_model_path: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/xreal_one_68_v3.xml"
+  cad_model_path: "datasets/hmd_xreal/annotations_v3/xreal_one_68_v3.xml"
   pretrained: true
 
 loss:

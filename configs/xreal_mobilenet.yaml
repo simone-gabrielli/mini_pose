@@ -7,9 +7,18 @@ data:
   heatmap_size: [64, 64]
   sigma: 3.0
 
-  train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/train.json"
-  val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/annotations/val.json"
-  image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/300W-xreal_air2/"
+  train_datasets:
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 1.0
+
+  primary_val: 300w_xreal_air2
+  val_datasets:
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 1.0
 
   batch_size: 32               # can be higher than hourglass due to lower mem
   num_workers: 0

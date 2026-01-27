@@ -114,7 +114,7 @@ python scripts/train_face_detector.py --config configs/face_mobilenet.yaml
 ### Train on multiple datasets (importance-weighted):
 
 Use `data.train_datasets` to mix multiple COCO-style datasets during training.
-Each dataset can have its own `loss_weight` to scale its contribution to the total loss.
+Each dataset can have its own `weight` to scale its contribution to the total loss.
 
 See the full example config at configs/xreal_mobilenet_hmd_plus_air2.yaml.
 
@@ -286,9 +286,17 @@ import pose.data      # noqa: F401  # ensures datasets register
 ```yaml
 data:
   type: my_dataset
-  train_json: ...
-  val_json: ...
-  image_root: ...
+  train_datasets:
+    - name: train
+      json_path: ...
+      image_root: ...
+      weight: 1.0
+  primary_val: val
+  val_datasets:
+    - name: val
+      json_path: ...
+      image_root: ...
+      weight: 1.0
   input_size: [256, 256]
   heatmap_size: [64, 64]
 ```
@@ -336,9 +344,18 @@ seed: 42
 
 data:
   type: coco_keypoints
-  train_json: "datasets/face/annotations/train.json"
-  val_json: "datasets/face/annotations/val.json"
-  image_root: "datasets/face/images"
+  train_datasets:
+    - name: face
+      json_path: "datasets/face/annotations/train.json"
+      image_root: "datasets/face/images"
+      weight: 1.0
+
+  primary_val: face
+  val_datasets:
+    - name: face
+      json_path: "datasets/face/annotations/val.json"
+      image_root: "datasets/face/images"
+      weight: 1.0
   input_size: [256, 256]
   heatmap_size: [64, 64]
   batch_size: 16

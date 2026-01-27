@@ -7,25 +7,25 @@ data:
 
   train_datasets:
     - name: hmd_xreal
-      train_json: "datasets/hmd_xreal/annotations/train.json"
+      json_path: "datasets/hmd_xreal/annotations/train.json"
       image_root: "datasets/hmd_xreal/images"
-      loss_weight: 1.0
+      weight: 1.0
 
     - name: 300w_xreal_air2
-      train_json: "datasets/300W-xreal_air2/annotations/train.json"
+      json_path: "datasets/300W-xreal_air2/annotations/train.json"
       image_root: "datasets/300W-xreal_air2"
-      loss_weight: 0.4
+      weight: 0.4
 
   # Multi-dataset validation.
   primary_val: hmd_xreal
   val_datasets:
     - name: hmd_xreal
-      val_json: "datasets/hmd_xreal/annotations/val.json"
+      json_path: "datasets/hmd_xreal/annotations/val.json"
       image_root: "datasets/hmd_xreal/images"
       weight: 1.0
 
     - name: 300w_xreal_air2
-      val_json: "datasets/300W-xreal_air2/annotations/val.json"
+      json_path: "datasets/300W-xreal_air2/annotations/val.json"
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
