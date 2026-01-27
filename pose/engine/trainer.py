@@ -142,9 +142,9 @@ class Trainer:
         Expected dataset batch format (dict):
             - 'image'   : (B,3,H,W) float tensor, ImageNet-normalized
             - 'visible' : (B,K) visibility mask for keypoints (when applicable)
-            - 'heatmaps' : supervision targets for heatmap models
-            - 'keypoints': (B,K,3) with (x,y,vis/score) in *input crop pixel space*
             - optional task-specific keys:
+                - 'heatmaps' : supervision targets for heatmap models
+                - 'keypoints': (B,K,3) with (x,y,vis/score) in *input crop pixel space*
                 - 'bbox' (bbox detector)
                 - 'pose_weights' (reprojection loss)
                 - 'dataset_weight' (for multi-dataset weighted sampling)
@@ -161,10 +161,11 @@ class Trainer:
             raise KeyError("Config is missing required key: data.input_size")
 
         # Only pass dataset kwargs that are explicitly specified.
-        # Most datasets have sensible defaults for things like heatmap_size/sigma.
         base_kwargs: dict[str, Any] = {
             "input_size": tuple(ds_cfg["input_size"]),
         }
+
+        # Optional: only for models that use heatmaps
         if "heatmap_size" in ds_cfg:
             base_kwargs["heatmap_size"] = tuple(ds_cfg["heatmap_size"])
 
@@ -172,8 +173,6 @@ class Trainer:
         # are generated at the requested spatial resolution with matching sigma.
         if "sigma" in ds_cfg:
             base_kwargs["sigma"] = ds_cfg["sigma"]
-
-
 
 
         # Multi-dataset training (optional)
@@ -212,12 +211,11 @@ class Trainer:
                 # Per-dataset overrides (optional). This lets you omit keys at the
                 # top-level and only specify them where they matter.
                 ds_kwargs = dict(base_kwargs)
-                if "input_size" in item:
-                    ds_kwargs["input_size"] = tuple(item["input_size"])
+                ds_kwargs["input_size"] = tuple(item["input_size"]) # Required
                 if "heatmap_size" in item:
-                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"])
+                    ds_kwargs["heatmap_size"] = tuple(item["heatmap_size"]) # Optional
                 if "sigma" in item:
-                    ds_kwargs["sigma"] = item["sigma"]
+                    ds_kwargs["sigma"] = item["sigma"] # Optional
 
                 ds = DatasetCls(json_path=train_json, image_root=image_root, aug_cfg=aug_cfg, **ds_kwargs)
 
@@ -227,7 +225,7 @@ class Trainer:
 
             self.train_ds = WeightedConcatDataset(train_specs)
         else:
-            # single dataset (current behavior)
+            # single dataset
             self.train_ds = DatasetCls(
                 json_path=ds_cfg["train_json"],
                 image_root=ds_cfg["image_root"],
@@ -296,7 +294,7 @@ class Trainer:
                 if bs < 1:
                     raise ValueError("Validation batch_size must be >= 1")
 
-                num_workers = ds_cfg.get("num_workers", 4)
+                num_workers = ds_cfg.get("num_workers", 0)
                 loader = DataLoader(
                     ds,
                     batch_size=bs,
@@ -340,7 +338,7 @@ class Trainer:
                 **base_kwargs,
             )
 
-            num_workers = ds_cfg.get("num_workers", 4)
+            num_workers = ds_cfg.get("num_workers", 0)
             self.val_loader = DataLoader(
                 self.val_ds,
                 batch_size=int(ds_cfg.get("val_batch_size", ds_cfg["batch_size"])),
@@ -354,7 +352,7 @@ class Trainer:
             self.val_weights = {"val": 1.0}
             self.primary_val_name = "val"
 
-        num_workers = ds_cfg.get("num_workers", 4)
+        num_workers = ds_cfg.get("num_workers", 0)
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=ds_cfg["batch_size"],
