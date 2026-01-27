@@ -5,6 +5,10 @@ data:
   type: coco_face
   input_size: [192, 192]
 
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 0
+
   train_datasets:
     - name: hmd_xreal
       json_path: "datasets/hmd_xreal/annotations/train.json"
@@ -29,10 +33,8 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
-  batch_size: 32
-  # Windows tends to be more stable with num_workers=0 unless you really need speed.
-  num_workers: 0
   aug:
+    enabled: true
     use_bbox_crop: false
     face_margin: 0.25
     hflip_p: 0.5
@@ -48,6 +50,9 @@ data:
       gauss_noise_var: [10.0, 50.0]
       compression_p: 0.2
       compression_quality: [60, 100]
+
+#   val_aug:
+#     enabled: false
 
 model:
   name: tiny_face

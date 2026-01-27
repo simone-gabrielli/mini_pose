@@ -230,6 +230,15 @@ class Trainer:
 
         self.train_ds = WeightedConcatDataset(train_specs)
 
+        # Validation augmentation defaults:
+        # - If data.val_aug is provided, use it.
+        # - Else: inherit from data.aug.
+        #   (If you want deterministic validation, set data.val_aug.enabled: false explicitly.)
+        base_val_aug = ds_cfg.get("val_aug", None)
+        if base_val_aug is None:
+            a = ds_cfg.get("aug", None)
+            base_val_aug = dict(a) if isinstance(a, dict) else a
+
         val_items = ds_cfg.get("val_datasets")
         if not isinstance(val_items, list) or len(val_items) == 0:
             raise KeyError("Config is missing required key: data.val_datasets (non-empty list)")
@@ -255,7 +264,7 @@ class Trainer:
             if not isinstance(image_root, str) or not image_root:
                 raise ValueError("Each val dataset must provide image_root as a non-empty string")
 
-            aug_cfg = item.get("aug", ds_cfg.get("aug", None))
+            aug_cfg = item.get("aug", base_val_aug)
 
             ds_kwargs = dict(base_kwargs)
             if "input_size" in item:
@@ -352,26 +361,24 @@ class Trainer:
 
         # Optimizer / Scheduler
         #
-        # Standard schema (preferred):
+        # Standard schema:
         #   train:
         #     optimizer: {name, lr, weight_decay?, betas?}
         #     scheduler: {name, ...}
-        #
-        # Legacy fallback (still accepted):
-        #   train: {optimizer, lr, weight_decay, betas, lr_schedule, lr_steps, lr_gamma, ...}
         train_cfg = cfg["train"]
 
-        opt_cfg = train_cfg.get("optimizer", {})
-        if isinstance(opt_cfg, dict):
-            opt_name = str(opt_cfg.get("name", "adam")).lower()
-            lr = float(opt_cfg.get("lr", train_cfg.get("lr")))
-            weight_decay = float(opt_cfg.get("weight_decay", train_cfg.get("weight_decay", 0.0)))
-            betas = tuple(opt_cfg.get("betas", train_cfg.get("betas", [0.9, 0.999])))
-        else:
-            opt_name = str(opt_cfg or train_cfg.get("optimizer", "adam")).lower()
-            lr = float(train_cfg["lr"])
-            weight_decay = float(train_cfg.get("weight_decay", 0.0))
-            betas = tuple(train_cfg.get("betas", [0.9, 0.999]))
+        opt_cfg = train_cfg.get("optimizer")
+        if not isinstance(opt_cfg, dict):
+            raise KeyError("Config is missing required key: train.optimizer (dict)")
+
+        opt_name = str(opt_cfg.get("name", "adam")).lower()
+        if "lr" not in opt_cfg:
+            raise KeyError("Config is missing required key: train.optimizer.lr")
+        lr = float(opt_cfg["lr"])
+        weight_decay = float(opt_cfg.get("weight_decay", 0.0))
+        betas = tuple(opt_cfg.get("betas", [0.9, 0.999]))
+        if len(betas) != 2:
+            raise ValueError("train.optimizer.betas must be a 2-tuple/list")
 
         if opt_name == "adam":
             self.optimizer = torch.optim.Adam(
@@ -390,35 +397,26 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported optimizer: {opt_name}")
 
-        sched_cfg = train_cfg.get("scheduler", {})
-        if isinstance(sched_cfg, dict) and sched_cfg:
-            sched_name = str(sched_cfg.get("name", "multistep")).lower()
-        else:
-            sched_name = str(train_cfg.get("lr_schedule", "multistep")).lower()
+        sched_cfg = train_cfg.get("scheduler")
+        if not isinstance(sched_cfg, dict):
+            raise KeyError("Config is missing required key: train.scheduler (dict)")
+
+        if "name" not in sched_cfg:
+            raise KeyError("Config is missing required key: train.scheduler.name")
+        sched_name = str(sched_cfg["name"]).lower()
 
         if sched_name == "multistep":
-            if isinstance(sched_cfg, dict) and sched_cfg:
-                milestones = sched_cfg.get("milestones", sched_cfg.get("lr_steps", [30, 50]))
-                gamma = sched_cfg.get("gamma", sched_cfg.get("lr_gamma", 0.1))
-            else:
-                milestones = train_cfg.get("lr_steps", [30, 50])
-                gamma = train_cfg.get("lr_gamma", 0.1)
+            milestones = sched_cfg.get("milestones", [30, 50])
+            gamma = sched_cfg.get("gamma", 0.1)
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 self.optimizer,
                 milestones=milestones,
                 gamma=gamma,
             )
         elif sched_name in ("cosine_warmup", "cosine", "cosine_with_warmup"):
-            if isinstance(sched_cfg, dict) and sched_cfg:
-                warmup_epochs = int(sched_cfg.get("warmup_epochs", train_cfg.get("warmup_epochs", 5)))
-                min_lr = float(sched_cfg.get("min_lr", train_cfg.get("min_lr", 0.0)))
-                warmup_start_factor = float(
-                    sched_cfg.get("warmup_start_factor", train_cfg.get("warmup_start_factor", 0.1))
-                )
-            else:
-                warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
-                min_lr = float(train_cfg.get("min_lr", 0.0))
-                warmup_start_factor = float(train_cfg.get("warmup_start_factor", 0.1))
+            warmup_epochs = int(sched_cfg.get("warmup_epochs", 5))
+            min_lr = float(sched_cfg.get("min_lr", 0.0))
+            warmup_start_factor = float(sched_cfg.get("warmup_start_factor", 0.1))
 
             # If user selected explicit cosine_warmup, force at least 1 warmup epoch.
             if sched_name == "cosine_warmup":
@@ -454,7 +452,7 @@ class Trainer:
                     eta_min=min_lr,
                 )
         else:
-            raise ValueError(f"Unsupported lr_schedule: {sched_name}")
+            raise ValueError(f"Unsupported train.scheduler.name: {sched_name}")
 
         # Regularization bundle flags
         self.grad_clip_norm = float(train_cfg.get("grad_clip_norm", 0.0))

@@ -10,6 +10,10 @@ data:
   input_size: [256, 256]      # Standard input size for LOTR
   # Not heatmap based, so no heatmap_size or sigma needed
 
+  batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+
   # Mix multiple COCO-style datasets for training.
   # Each entry contributes samples to the same training loader.
   # loss_weight scales the contribution of that dataset to the loss.
@@ -37,9 +41,8 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
-  batch_size: 16
-  num_workers: 4
   aug:
+    enabled: true
     use_bbox_crop: true
     face_margin: 0.5
     hflip_p: 0.5
@@ -88,6 +91,11 @@ data:
       gauss_noise_var: [10.0, 50.0]
       compression_p: 0.2
       compression_quality: [60, 100]
+
+  # val_aug:
+  #   enabled: false
+  #   use_bbox_crop: true
+  #   face_margin: 0.5
 
 model:
   name: lotr

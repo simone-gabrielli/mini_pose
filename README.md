@@ -105,11 +105,7 @@ python scripts/train.py --config configs/face_mobilenet.yaml
 
 This uses dataset type `coco_face` (single-face bbox regression with optional negative images) and loss `bbox_detector`.
 
-If you want the legacy dedicated trainer for the detector, it’s still available:
-
-```bash
-python scripts/train_face_detector.py --config configs/face_mobilenet.yaml
-```
+This uses the same standardized config format as the keypoint models.
 
 ### Train on multiple datasets (importance-weighted):
 
@@ -359,10 +355,16 @@ data:
   input_size: [256, 256]
   heatmap_size: [64, 64]
   batch_size: 16
+  val_batch_size: 16
   num_workers: 4
 
-  # Optional: augmentation config
+  # Augmentations
+  # - data.aug is used for training.
+  # - data.val_aug is used for validation.
+  #   If data.val_aug is omitted, it defaults to data.aug.
+  #
   # aug:
+  #   enabled: true
   #   # Horizontal flip is a strong regularizer, but you MUST provide flip_pairs
   #   # so left/right landmark semantics stay correct.
   #   hflip_p: 0.5
@@ -418,6 +420,11 @@ train:
   scheduler:
     name: multistep
     milestones: [30, 40]
+
+  # Recommended: make validation deterministic and comparable.
+  # data:
+  #   val_aug:
+  #     enabled: false
     gamma: 0.1
   output_dir: "work_dirs/example_hourglass"
 

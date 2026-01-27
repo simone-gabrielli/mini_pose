@@ -7,6 +7,10 @@ data:
   heatmap_size: [64, 64]
   sigma: 3.0
 
+  batch_size: 8
+  val_batch_size: 8
+  num_workers: 0
+
   train_datasets:
     - name: hmd_xreal_v3
       json_path: "datasets/hmd_xreal/annotations_v3/train.json"
@@ -20,9 +24,8 @@ data:
       image_root: "datasets/hmd_xreal/images"
       weight: 1.0
 
-  batch_size: 8
-  num_workers: 0
   aug:
+    enabled: true
     use_bbox_crop: true
     face_margin: 0.25
     hflip_p: 0.5
@@ -71,6 +74,11 @@ data:
       gauss_noise_var: [10.0, 50.0]
       compression_p: 0.2
       compression_quality: [60, 100]
+
+  # val_aug:
+  #   enabled: false
+  #   use_bbox_crop: true
+  #   face_margin: 0.25
 
 model:
   name: fan_2d

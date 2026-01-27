@@ -75,6 +75,7 @@ class CocoFaceDataset(Dataset):
         # we don't have keypoints, so pass None for keypoints when calling.
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
+            enabled=bool(aug_cfg.get("enabled", True)),
             hflip_p=aug_cfg.get("hflip_p", 0.0),
             rotation=aug_cfg.get("rotation", 15),
             scale=aug_cfg.get("scale", 0.10),

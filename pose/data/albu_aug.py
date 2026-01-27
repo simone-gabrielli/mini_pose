@@ -59,6 +59,7 @@ class AlbumentationsKeypointPipeline:
     def __init__(
         self,
         input_size=(256, 256),
+        enabled: bool = True,
         hflip_p: float = 0.0,
         flip_pairs: list[list[int]] | list[tuple[int, int]] | None = None,
         rotation=15,
@@ -68,11 +69,12 @@ class AlbumentationsKeypointPipeline:
         content_cfg: dict | None = None,
     ):
         self.input_size = input_size
-        self.hflip_p = float(hflip_p)
+        self.enabled = bool(enabled)
+        self.hflip_p = float(hflip_p) if self.enabled else 0.0
 
         # Normalize flip_pairs to a list[tuple[int,int]]
         self.flip_pairs: list[tuple[int, int]] | None = None
-        if flip_pairs is not None:
+        if self.enabled and flip_pairs is not None:
             pairs: list[tuple[int, int]] = []
             for p in flip_pairs:
                 if isinstance(p, (list, tuple)) and len(p) == 2:
@@ -84,12 +86,13 @@ class AlbumentationsKeypointPipeline:
         content_cfg = content_cfg or {}
 
         # Read content augmentation params (with sensible defaults)
-        brightness_contrast_p = float(content_cfg.get("brightness_contrast_p", 0.5))
-        sunflare_p = float(content_cfg.get("sunflare_p", 0.15))
-        motion_blur_p = float(content_cfg.get("motion_blur_p", 0.15))
-        gauss_noise_p = float(content_cfg.get("gauss_noise_p", 0.2))
+        # If disabled, force all probabilities to 0.
+        brightness_contrast_p = float(content_cfg.get("brightness_contrast_p", 0.5)) if self.enabled else 0.0
+        sunflare_p = float(content_cfg.get("sunflare_p", 0.15)) if self.enabled else 0.0
+        motion_blur_p = float(content_cfg.get("motion_blur_p", 0.15)) if self.enabled else 0.0
+        gauss_noise_p = float(content_cfg.get("gauss_noise_p", 0.2)) if self.enabled else 0.0
         gauss_noise_var = tuple(content_cfg.get("gauss_noise_var", [10.0, 50.0]))
-        compression_p = float(content_cfg.get("compression_p", 0.2))
+        compression_p = float(content_cfg.get("compression_p", 0.2)) if self.enabled else 0.0
         compression_quality = tuple(content_cfg.get("compression_quality", [60, 100]))
 
         # Compose two pipelines:
@@ -97,6 +100,31 @@ class AlbumentationsKeypointPipeline:
         # - content_transform: only content-changing transforms (flares, noise,
         #   compression, color) + resize. Used when a bbox is present to avoid
         #   changing bounding box geometry.
+
+        # If disabled, only do deterministic resize (still normalize later).
+        if not self.enabled:
+            resize = [A.Resize(height=input_size[1], width=input_size[0])]
+            self.content_transform = A.ReplayCompose(
+                resize,
+                keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+                additional_targets={"image2": "image"},
+            )
+            self.content_no_bbox_transform = A.ReplayCompose(
+                resize,
+                keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+                additional_targets={"image2": "image"},
+            )
+            self.full_transform = A.ReplayCompose(
+                resize,
+                keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
+                bbox_params=A.BboxParams(format="pascal_voc", label_fields=[]),
+                additional_targets={"image2": "image"},
+            )
+
+            # ImageNet normalization constants (matches typical A.Normalize default)
+            self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            return
 
         # Build content-only transforms
         content_transforms = [

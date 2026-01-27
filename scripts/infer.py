@@ -153,7 +153,7 @@ def _infer_landmarks_on_crop(
         return None
 
     def _extract_heatmaps_last(model_out: object) -> torch.Tensor:
-        # Match Trainer._visualize_model_outputs selection logic for heatmap models.
+        # Match Trainer's heatmap-output selection logic.
         if isinstance(model_out, tuple):
             # If tuple[0] is a tensor and looks like heatmaps, use it.
             if len(model_out) >= 1 and isinstance(model_out[0], torch.Tensor):
