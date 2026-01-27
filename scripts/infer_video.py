@@ -1,13 +1,13 @@
 """Run landmark inference on a video and save annotated video.
 
 Features:
-- Multiple detector backends: MTCNN (facenet-pytorch), dlib, composite Haar, haar
+- Face detection backends: OpenCV YuNet, TinyFace (single-face)
 - Batch face crops per frame for faster GPU throughput
 - Mixed precision with `--fp16` on CUDA
 - Graceful shutdown: Ctrl+C saves the output before exiting
 
 Examples:
-python scripts/infer_video.py --checkpoint work_dirs/xreal_fan2d/best.pth --input-video input.mp4 --fp16
+python scripts/infer_video.py --checkpoint work_dirs/xreal_lotr_light/best.pth --input-video input.mp4 --fp16
 """
 import argparse
 import math
@@ -35,7 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--input-video", required=True)
     parser.add_argument("--output-video", default=None)
-    parser.add_argument("--model-name", default="fan_2d")
+    parser.add_argument("--model-name", default="lotr_light")
     parser.add_argument("--num-keypoints", type=int, default=68)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--input-size", type=int, default=256)
@@ -54,35 +54,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use strict checkpoint loading (only applies when --config is set).",
     )
-    parser.add_argument("--face-margin", type=float, default=0.5, help="Margin around detected face box (training default)")
+    parser.add_argument(
+        "--face-margin",
+        type=float,
+        default=50.0,
+        help="Extra margin around detected face box, as a percentage (e.g. 50 -> +50%%).",
+    )
 
-    # If your input video is built from a COCO dataset (frames are the dataset images
-    # in the same order as COCO annotations), you can bypass detection entirely and
-    # use the dataset bbox for cropping. This matches training/val much closer.
-    parser.add_argument("--coco-json", default=None, help="Optional COCO json; if set, uses bboxes in annotation order per frame")
-    parser.add_argument("--detector", choices=["auto", "mtcnn", "yunet", "dlib", "composite", "haar", "tinyface"], default="auto")
-    parser.add_argument("--yunet-model", default=None, help="Path to YuNet ONNX model (required if --detector yunet)")
-    parser.add_argument("--yunet-score", type=float, default=0.4, help="YuNet score threshold")
-    parser.add_argument("--yunet-nms", type=float, default=0.3, help="YuNet NMS threshold")
-    parser.add_argument("--yunet-topk", type=int, default=5000, help="YuNet top_k")
+    # Detection backend for face boxes.
+    parser.add_argument("--detector", choices=["auto", "yunet", "tinyface"], default="auto")
+    parser.add_argument(
+        "--detector-score",
+        type=float,
+        default=0.4,
+        help="Score threshold for detectors that output a score/confidence.",
+    )
+    parser.add_argument(
+        "--yunet-model",
+        default=None,
+        help="Path to YuNet ONNX model (used when --detector is yunet/auto).",
+    )
 
     parser.add_argument(
         "--tinyface-checkpoint",
         default=None,
-        help="Path to TinyFace detector checkpoint (.pth). If omitted, uses ImageNet-pretrained backbone weights only (not a detector checkpoint).",
+        help="Path to TinyFace detector checkpoint (.pth). If omitted, uses ImageNet-pretrained backbone weights.",
     )
     parser.add_argument("--tinyface-input", type=int, default=256, help="TinyFace detector square input size")
-    parser.add_argument("--tinyface-conf", type=float, default=0.3, help="TinyFace confidence threshold")
-    parser.add_argument(
-        "--tinyface-backbone",
-        default="mobilenet_v3_small",
-        choices=["mobilenet_v2", "mobilenet_v3_small"],
-        help="TinyFace backbone architecture (must match training config when loading a checkpoint)",
-    )
-    parser.add_argument("--tinyface-width-mult", type=float, default=1.0, help="TinyFace MobileNet width multiplier")
-    parser.add_argument("--tinyface-embed-dim", type=int, default=128, help="TinyFace head embedding dimension")
-    parser.add_argument("--tinyface-dropout", type=float, default=0.1, help="TinyFace head dropout")
-    parser.add_argument("--tinyface-no-pretrained", action="store_true", help="Do not use ImageNet pretrained backbone when no checkpoint is provided")
 
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--max-faces", type=int, default=4)
@@ -146,6 +144,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int, int] = (0, 0, 255)):
+    """Draw 2D landmark points (x,y) onto a BGR frame."""
     for (xk, yk) in coords:
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
 
@@ -188,6 +187,11 @@ def _load_3d_landmarks_xml(xml_path: str) -> np.ndarray:
 
 
 def _camera_matrix_from_args(W: int, H: int, args) -> np.ndarray:
+    """Build an OpenCV pinhole camera matrix K from CLI args.
+
+    If fx/fy aren't provided, use a simple heuristic (max(W,H)). Optionally
+    derive focal length from a horizontal FOV.
+    """
     cx = float(args.cam_cx) if args.cam_cx is not None else (W / 2.0)
     cy = float(args.cam_cy) if args.cam_cy is not None else (H / 2.0)
 
@@ -446,128 +450,27 @@ def _try_extract_coords_batch(model_out: object) -> torch.Tensor | None:
     return coords[..., :2]
 
 
-def _load_coco_bboxes_in_annotation_order(coco_json_path: str) -> list[tuple[float, float, float, float]]:
-    import json
-
-    with open(coco_json_path, "r", encoding="utf-8") as f:
-        coco = json.load(f)
-
-    anns = coco.get("annotations", [])
-    out: list[tuple[float, float, float, float]] = []
-    for a in anns:
-        b = a.get("bbox", None)
-        if b is None or len(b) != 4:
-            out.append((0.0, 0.0, 0.0, 0.0))
-            continue
-        out.append((float(b[0]), float(b[1]), float(b[2]), float(b[3])))
-    if not out:
-        raise ValueError(f"No annotations/bboxes found in {coco_json_path}")
-    return out
-
-
 def build_detector(
     choice: str,
     device,
     *,
+    score_thresh: float = 0.4,
     yunet_model: str | None = None,
-    yunet_score_thresh: float = 0.8,
-    yunet_nms_thresh: float = 0.3,
-    yunet_top_k: int = 5000,
     tinyface_checkpoint: str | None = None,
     tinyface_input: int = 256,
-    tinyface_conf_thresh: float = 0.3,
-    tinyface_backbone: str = "mobilenet_v3_small",
-    tinyface_width_mult: float = 1.0,
-    tinyface_embed_dim: int = 128,
-    tinyface_dropout: float = 0.1,
-    tinyface_pretrained: bool = True,
     fp16: bool = False,
 ):
-    # MTCNN
-    def make_mtcnn(device_str="cpu"):
+    def _default_yunet_path() -> str | None:
+        # shipped in this repo under scripts/video_test/yunet_detector/
         try:
-            from facenet_pytorch import MTCNN
-
-            mt = MTCNN(keep_all=True, device=device_str)
-
-            class MTCNNDetector:
-                def __init__(self, mt):
-                    self.mt = mt
-
-                def detect(self, img_bgr):
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    boxes, _ = self.mt.detect(img_rgb)
-                    if boxes is None:
-                        return []
-                    out = []
-                    for (x1, y1, x2, y2) in boxes:
-                        w = int(max(1, x2 - x1))
-                        h = int(max(1, y2 - y1))
-                        out.append((int(x1), int(y1), w, h))
-                    return out
-
-            return MTCNNDetector(mt)
+            base = os.path.dirname(os.path.abspath(__file__))
+            p = os.path.join(base, "video_test", "yunet_detector", "face_detection_yunet_2023mar.onnx")
+            return p if os.path.exists(p) else None
         except Exception:
             return None
-
-    # dlib
-    def make_dlib():
-        try:
-            import dlib
-
-            detector = dlib.get_frontal_face_detector()
-
-            class DlibDetector:
-                def __init__(self, det):
-                    self.det = det
-
-                def detect(self, img_bgr):
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    dets = self.det(img_rgb, 1)
-                    out = []
-                    for d in dets:
-                        x1 = d.left()
-                        y1 = d.top()
-                        x2 = d.right()
-                        y2 = d.bottom()
-                        out.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
-                    return out
-
-            return DlibDetector(detector)
-        except Exception:
-            return None
-
-    # composite Haar (frontal + profile)
-    class CompositeHaarDetector:
-        def __init__(self):
-            from pathlib import Path
-            base = cv2.data.haarcascades
-            self.frontal = cv2.CascadeClassifier(str(Path(base) / "haarcascade_frontalface_default.xml"))
-            self.profile = cv2.CascadeClassifier(str(Path(base) / "haarcascade_profileface.xml"))
-
-        def detect(self, img_bgr):
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            boxes = []
-            if not self.frontal.empty():
-                boxes += list(self.frontal.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3))
-            if not self.profile.empty():
-                boxes += list(self.profile.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3))
-            out = []
-            for (x, y, w, h) in boxes:
-                out.append((int(x), int(y), int(w), int(h)))
-            return out
-
-    class HaarWrapper:
-        def __init__(self):
-            from pose.detectors.haar_face import HaarFaceDetector
-
-            self.det = HaarFaceDetector()
-
-        def detect(self, img_bgr):
-            return self.det.detect(img_bgr)
 
     # OpenCV YuNet (FaceDetectorYN)
-    def make_yunet(model_path: str, score_thresh: float = 0.8, nms_thresh: float = 0.3, top_k: int = 5000):
+    def make_yunet(model_path: str, score_thresh: float = 0.4):
         if not model_path or not os.path.exists(model_path):
             return None
 
@@ -583,7 +486,10 @@ def build_detector(
 
         try:
             # config is unused for YuNet ONNX
-            det = creator(model_path, "", (320, 320), float(score_thresh), float(nms_thresh), int(top_k))
+            try:
+                det = creator(model_path, "", (320, 320), float(score_thresh), 0.3, 5000)
+            except TypeError:
+                det = creator(model_path, "", (320, 320), float(score_thresh))
 
             class YuNetDetector:
                 def __init__(self, det):
@@ -605,7 +511,10 @@ def build_detector(
                     for f in faces:
                         # YuNet output: [x, y, w, h, score, ...]
                         x, y, bw, bh = f[:4]
-                        out.append((int(x), int(y), int(bw), int(bh)))
+                        score = float(f[4]) if len(f) > 4 else 1.0
+                        if score < float(score_thresh):
+                            continue
+                        out.append((int(x), int(y), int(bw), int(bh), float(score)))
                     return out
 
             return YuNetDetector(det)
@@ -617,12 +526,7 @@ def build_detector(
         checkpoint_path: str | None,
         *,
         input_size: int = 256,
-        conf_th: float = 0.3,
-        backbone: str = "mobilenet_v3_small",
-        width_mult: float = 1.0,
-        embed_dim: int = 128,
-        dropout: float = 0.1,
-        pretrained: bool = True,
+        conf_th: float = 0.4,
         fp16: bool = False,
     ):
         try:
@@ -652,23 +556,48 @@ def build_detector(
                 out[nk] = v
             return out
 
-        # Instantiate with matching architecture; when loading a trained checkpoint,
-        # pretrained should be False to avoid downloading weights.
-        model = TinyFaceDetector(
-            pretrained=bool(pretrained and not checkpoint_path),
-            backbone=str(backbone),
-            width_mult=float(width_mult),
-            embed_dim=int(embed_dim),
-            dropout=float(dropout),
-        )
-
+        # Instantiate with a matching backbone. For usability we infer the backbone
+        # from the checkpoint (when provided) so we don't need a long list of CLI args.
+        inferred_backbone = "mobilenet_v2"
+        sd = None
         if checkpoint_path:
             try:
                 ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
             except TypeError:
                 ckpt = torch.load(checkpoint_path, map_location="cpu")
             sd = _strip_module_prefix(_get_state_dict(ckpt))
-            model.load_state_dict(sd, strict=True)
+
+            # Heuristic: MobileNetV3 checkpoints in torchvision have ".block." keys.
+            # Additionally, v3-small commonly has last_channel=576 (fc in_features).
+            try:
+                keys = list(sd.keys())
+                if any(".block." in k for k in keys):
+                    inferred_backbone = "mobilenet_v3_small"
+                else:
+                    w0 = sd.get("features.0.0.weight")
+                    fc1 = sd.get("fc.1.weight")
+                    if isinstance(w0, torch.Tensor) and int(w0.shape[0]) == 16:
+                        inferred_backbone = "mobilenet_v3_small"
+                    if isinstance(fc1, torch.Tensor) and int(fc1.shape[1]) == 576:
+                        inferred_backbone = "mobilenet_v3_small"
+            except Exception:
+                pass
+
+        model = TinyFaceDetector(
+            pretrained=bool(not checkpoint_path),
+            backbone=str(inferred_backbone),
+        )
+
+        if checkpoint_path and sd is not None:
+            try:
+                model.load_state_dict(sd, strict=True)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    "TinyFace checkpoint is not compatible with the TinyFaceDetector architecture. "
+                    f"Inferred backbone='{inferred_backbone}'. "
+                    "If this checkpoint is from a different model, use a proper TinyFace detector checkpoint "
+                    "or switch to '--detector yunet'.\n\nOriginal error:\n" + str(e)
+                )
 
         model.to(device)
         model.eval()
@@ -706,6 +635,7 @@ def build_detector(
                 if not res or res[0].get("bbox") is None:
                     return []
 
+                conf = float(res[0].get("conf", 1.0))
                 x1, y1, x2, y2 = res[0]["bbox"]
 
                 # Map from square resized coords back to original frame coords.
@@ -724,22 +654,13 @@ def build_detector(
 
                 if x2 <= x1 or y2 <= y1:
                     return []
-                return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1))]
+                return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(conf))]
 
         return TinyFaceWrapper(model, input_size=input_size, conf_th=conf_th)
 
-    if choice == "mtcnn":
-        det = make_mtcnn(device_str=("cuda" if device.type == "cuda" else "cpu"))
-        if det is None:
-            raise RuntimeError("MTCNN requested but not available (install facenet-pytorch)")
-        return det
     if choice == "yunet":
-        det = make_yunet(
-            yunet_model or "",
-            score_thresh=yunet_score_thresh,
-            nms_thresh=yunet_nms_thresh,
-            top_k=yunet_top_k,
-        )
+        model_path = yunet_model or _default_yunet_path() or ""
+        det = make_yunet(model_path, score_thresh=float(score_thresh))
         if det is None:
             raise RuntimeError(
                 "YuNet requested but not available. Ensure: (1) opencv-contrib-python installed, "
@@ -750,38 +671,26 @@ def build_detector(
         det = make_tinyface(
             tinyface_checkpoint,
             input_size=tinyface_input,
-            conf_th=tinyface_conf_thresh,
-            backbone=str(tinyface_backbone),
-            width_mult=float(tinyface_width_mult),
-            embed_dim=int(tinyface_embed_dim),
-            dropout=float(tinyface_dropout),
-            pretrained=bool(tinyface_pretrained),
+            conf_th=float(score_thresh),
             fp16=fp16,
         )
         if det is None:
             raise RuntimeError("TinyFace requested but not available (check pose.detectors.face_detector and dependencies)")
         return det
-    if choice == "dlib":
-        det = make_dlib()
-        if det is None:
-            raise RuntimeError("dlib requested but not available")
-        return det
-    if choice == "composite":
-        return CompositeHaarDetector()
-    if choice == "haar":
-        return HaarWrapper()
 
-    # auto: prefer mtcnn -> dlib -> composite -> haar
-    det = make_mtcnn(device_str=("cuda" if device.type == "cuda" else "cpu"))
+    # auto: prefer YuNet (if model available) -> TinyFace
+    det = make_yunet((yunet_model or _default_yunet_path() or ""), score_thresh=float(score_thresh))
     if det is not None:
-        print("Using MTCNN detector")
+        print("Using YuNet detector")
         return det
-    det = make_dlib()
+    det = make_tinyface(tinyface_checkpoint, input_size=tinyface_input, conf_th=float(score_thresh), fp16=fp16)
     if det is not None:
-        print("Using dlib detector")
+        print("Using TinyFace detector")
         return det
-    print("Using composite Haar detector")
-    return CompositeHaarDetector()
+    raise RuntimeError(
+        "No detector available. For YuNet: install opencv-contrib-python and provide --yunet-model. "
+        "For TinyFace: ensure pose.detectors.face_detector dependencies are installed."
+    )
 
 
 def main():
@@ -875,45 +784,32 @@ def main():
     detector = build_detector(
         args.detector if args.detector != "auto" else "auto",
         device,
+        score_thresh=float(args.detector_score),
         yunet_model=args.yunet_model,
-        yunet_score_thresh=args.yunet_score,
-        yunet_nms_thresh=args.yunet_nms,
-        yunet_top_k=args.yunet_topk,
         tinyface_checkpoint=args.tinyface_checkpoint,
         tinyface_input=args.tinyface_input,
-        tinyface_conf_thresh=args.tinyface_conf,
-        tinyface_backbone=args.tinyface_backbone,
-        tinyface_width_mult=args.tinyface_width_mult,
-        tinyface_embed_dim=args.tinyface_embed_dim,
-        tinyface_dropout=args.tinyface_dropout,
-        tinyface_pretrained=(not bool(args.tinyface_no_pretrained)),
         fp16=bool(args.fp16),
     )
 
-    coco_bboxes = None
-    if args.coco_json:
-        coco_bboxes = _load_coco_bboxes_in_annotation_order(args.coco_json)
-        print(f"Loaded {len(coco_bboxes)} COCO bboxes from {args.coco_json}. Using bbox-per-frame mode (annotation order).")
     frame_idx = 0
     t_start = time.time()
     processed = 0
 
-    # reused buffers
-    kpts_dummy = np.zeros((args.num_keypoints, 3), dtype=np.float32)
-
-    # detector caching
+    # ---- Per-stream caches (avoid redundant work when detect/infer cadence > 1) ----
+    # last_boxes: list of detector boxes in full-frame pixel space.
+    # Each box is either (x, y, w, h) or (x, y, w, h, score).
     last_boxes = []
-    last_detect_frame = -10**9
+    last_detect_frame = -10**9  # counter in "processed" frames
 
-    # keypoint caching
-    last_kpts = []  # list[np.ndarray] in full-frame coords
+    # last_kpts: list of (K,2) landmarks in full-frame pixel space.
+    last_kpts = []
     last_kpts_frame = -10**9
 
-    # PnP caching (aligned with last_kpts)
-    last_pnp = []  # list[dict] with rvec,tvec,proj,err
+    # last_pnp: list aligned with last_kpts, each item contains rvec/tvec/proj/err.
+    last_pnp = []
     last_pnp_frame = -10**9
 
-    # debug crop caching
+    # Debug visualization cache for the tiled crop window.
     last_debug_tile = None
 
     # profiling accumulators (seconds)
@@ -949,6 +845,7 @@ def main():
         while True:
             t_total0 = perf_counter() if args.profile else None
 
+            # ---- 1) Read next frame ----
             t0 = perf_counter() if args.profile else None
             ret, frame_bgr = cap.read()
             if args.profile:
@@ -961,6 +858,7 @@ def main():
                 break
 
             if (frame_idx % args.skip_frames) != 0:
+                # Skip this frame entirely (write original frame, optionally preview).
                 t0 = perf_counter() if args.profile else None
                 writer.write(frame_bgr)
                 if args.profile:
@@ -987,22 +885,12 @@ def main():
                 frame_idx += 1
                 continue
 
-            # Face detection OR COCO bbox-per-frame mode
+            # ---- 2) Face detection (optionally cached) ----
             t0 = perf_counter() if args.profile else None
             do_detect = (processed - last_detect_frame) >= max(1, args.detect_every)
             boxes = last_boxes
 
-            if coco_bboxes is not None:
-                # Bbox-per-frame: assumes each processed frame corresponds to the next COCO annotation.
-                idx = processed
-                if idx >= len(coco_bboxes):
-                    break
-                x, y, bw, bh = coco_bboxes[idx]
-                boxes = [(int(x), int(y), int(bw), int(bh))]
-                last_boxes = boxes
-                last_detect_frame = processed
-                do_detect = True
-            elif do_detect:
+            if do_detect:
                 det_frame = frame_bgr
                 scale = float(args.detector_scale)
                 if scale != 1.0 and scale > 0:
@@ -1015,8 +903,14 @@ def main():
                 if scale != 1.0 and scale > 0 and boxes:
                     inv = 1.0 / scale
                     scaled = []
-                    for (x, y, w, h) in boxes:
-                        scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv)))
+                    for b in boxes:
+                        if b is None or len(b) < 4:
+                            continue
+                        x, y, w, h = b[0], b[1], b[2], b[3]
+                        if len(b) >= 5:
+                            scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv), float(b[4])))
+                        else:
+                            scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv)))
                     boxes = scaled
                 last_boxes = boxes
                 last_detect_frame = processed
@@ -1024,7 +918,7 @@ def main():
             if args.profile:
                 prof["detect"] += perf_counter() - t0
 
-            # Keypoint inference (optionally cached)
+            # ---- 3) Landmark inference (optionally cached) ----
             do_infer = (processed - last_kpts_frame) >= max(1, args.infer_every)
             if do_detect:
                 # if boxes just changed, ensure we refresh keypoints
@@ -1036,8 +930,13 @@ def main():
                 boxes_clamped = []
                 face_inputs_bgr = []  # resized (stretched) model inputs, BGR
                 for box in boxes[: args.max_faces]:
-                    x, y, w, h = box
-                    margin = float(args.face_margin)
+                    if box is None or len(box) < 4:
+                        continue
+                    x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    # --face-margin is percent (e.g. 50 -> +50%). For backward compat,
+                    # treat values in [0..1.5] as already-a-fraction.
+                    m = float(args.face_margin)
+                    margin = (m / 100.0) if m > 1.5 else m
                     cx = x + w / 2.0
                     cy = y + h / 2.0
                     size = max(w, h) * (1.0 + margin)
@@ -1196,11 +1095,15 @@ def main():
                         if args.profile:
                             prof["decode_draw"] += perf_counter() - t1
 
-            # Draw cached keypoints + current boxes
+            # ---- 4) Draw overlays ----
+            # We draw the *latest cached* keypoints, which may be from a previous
+            # frame if --infer-every > 1.
             if boxes:
                 t0 = perf_counter() if args.profile else None
                 for i, box in enumerate(boxes[: args.max_faces]):
-                    x, y, w, h = box
+                    if box is None or len(box) < 4:
+                        continue
+                    x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
                     if args.draw_face_box:
                         pad = int(max(0, args.box_pad))
                         x1 = max(0, int(x) - pad)
