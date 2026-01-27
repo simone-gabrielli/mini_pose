@@ -5,7 +5,10 @@ experiment: xreal_lotr_light
 seed: 42
 
 data:
-  type: coco_keypoints
+  type: coco_keypointsù
+  input_size: [192, 192]      # Smaller input for speed
+  # Not heatmap based, so no heatmap_size or sigma needed
+
   # Mix multiple COCO-style datasets for training.
   # Each entry contributes samples to the same training loader.
   # loss_weight scales the contribution of that dataset to the loss.
@@ -32,7 +35,6 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
-  input_size: [192, 192]      # Smaller input for speed
   batch_size: 16              # Larger batch size due to smaller model
   num_workers: 4
   aug:

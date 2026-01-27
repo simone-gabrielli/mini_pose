@@ -3,6 +3,8 @@ seed: 1337
 
 data:
   type: coco_face
+  input_size: [192, 192]
+
   train_datasets:
     - name: hmd_xreal
       train_json: "datasets/hmd_xreal/annotations/train.json"
@@ -26,8 +28,7 @@ data:
       val_json: "datasets/300W-xreal_air2/annotations/val.json"
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
-      
-  input_size: [192, 192]
+
   batch_size: 32
   # Windows tends to be more stable with num_workers=0 unless you really need speed.
   num_workers: 0

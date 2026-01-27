@@ -3,11 +3,14 @@ seed: 42
 
 data:
   type: coco_keypoints
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  sigma: 3.0
+
   train_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/train.json"
   val_json: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/annotations_v3/val.json"
   image_root: "C:/Users/simog/hmdrive/head_tracking/mini_pose/datasets/hmd_xreal/images"
-  input_size: [256, 256]
-  heatmap_size: [64, 64]
+
   batch_size: 8
   num_workers: 0
   aug:

@@ -3,6 +3,9 @@ seed: 42
 
 data:
   type: coco_keypoints
+  input_size: [256, 256]
+  heatmap_size: [64, 64]
+  sigma: 3.0
 
   # Mix multiple COCO-style datasets for training.
   # Each entry contributes samples to the same training loader.
@@ -31,8 +34,6 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 1.0
 
-  input_size: [256, 256]
-  heatmap_size: [64, 64]
   batch_size: 8
   num_workers: 0
   aug:

@@ -7,6 +7,9 @@ seed: 42
 
 data:
   type: coco_keypoints
+  input_size: [256, 256]      # Standard input size for LOTR
+  # Not heatmap based, so no heatmap_size or sigma needed
+
   # Mix multiple COCO-style datasets for training.
   # Each entry contributes samples to the same training loader.
   # loss_weight scales the contribution of that dataset to the loss.
@@ -34,7 +37,6 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
-  input_size: [256, 256]      # Standard input size for LOTR
   batch_size: 16
   num_workers: 4
   aug:
