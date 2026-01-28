@@ -330,6 +330,21 @@ class Trainer:
                 continue
             model_kwargs[k] = v
 
+        # Keep coordinate-regression models (e.g. LOTR/LOTRLight) consistent with
+        # the dataset resize used for training.
+        # Most of the codebase treats input_size as (W, H); datasets/aug pipeline
+        # and inference resize follow that convention.
+        if "input_size" not in model_kwargs and "input_size" in ds_cfg:
+            try:
+                sig = inspect.signature(ModelCls.__init__)
+                params = sig.parameters
+                accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                if accepts_var_kw or ("input_size" in params):
+                    model_kwargs["input_size"] = tuple(ds_cfg["input_size"])
+            except Exception:
+                # If signature inspection fails, avoid forcing extra kwargs.
+                pass
+
         # Only pass kwargs that the model constructor actually accepts.
         # Some registered classes (e.g. detector heads) do not accept
         # `num_keypoints` or other pose-specific kwargs; guard against
@@ -492,11 +507,20 @@ class Trainer:
         # If the original config path is provided in cfg["_config_path"], copy it
         cfg_path = cfg.get("_config_path")
         if isinstance(cfg_path, str) and os.path.isfile(cfg_path):
+            dst = os.path.join(self.output_dir, os.path.basename(cfg_path))
             try:
-                shutil.copy2(cfg_path, os.path.join(self.output_dir, os.path.basename(cfg_path)))
-            except Exception:
-                # best-effort; ignore failures so training is not blocked
-                pass
+                # Ensure we always overwrite the destination file when present.
+                if os.path.isfile(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        # If removal fails, continue and let copy2 attempt to overwrite.
+                        pass
+                shutil.copy2(cfg_path, dst)
+                print(f"Saved training config to {dst}")
+            except Exception as ex:
+                # best-effort; ignore failures so training is not blocked but warn.
+                print(f"[WARN] Could not copy config {cfg_path} to {dst}: {ex}")
 
         # generic history: split -> metric_name -> list[float]
         self.history = {"train": {}, "val": {}}
@@ -585,9 +609,15 @@ class Trainer:
 
                     # LOTR returns (normalized_coords, pixel_coords)
                     if isinstance(out, tuple) and len(out) == 2:
-                        _, landmarks_pixel = out
-                        # Use pixel coordinates for loss computation
-                        preds_2d = landmarks_pixel[..., :2]  # (B, N, 2)
+                        landmarks_norm, _ = out
+                        # Prefer normalized coords to avoid any dependency on
+                        # model.input_size scaling. Convert to pixel space using
+                        # the *actual* model input tensor size.
+                        preds_2d = landmarks_norm[..., :2].clone()  # (B,N,2)
+                        H_in = float(imgs.shape[-2])
+                        W_in = float(imgs.shape[-1])
+                        preds_2d[..., 0] *= W_in
+                        preds_2d[..., 1] *= H_in
                     else:
                         preds_2d = out
                         if preds_2d.dim() == 2:
@@ -731,8 +761,12 @@ class Trainer:
                     out = self.model(imgs)
 
                     if isinstance(out, tuple) and len(out) == 2:
-                        _, landmarks_pixel = out
-                        preds_2d = landmarks_pixel[..., :2]
+                        landmarks_norm, _ = out
+                        preds_2d = landmarks_norm[..., :2].clone()
+                        H_in = float(imgs.shape[-2])
+                        W_in = float(imgs.shape[-1])
+                        preds_2d[..., 0] *= W_in
+                        preds_2d[..., 1] *= H_in
                     else:
                         preds_2d = out
                         if preds_2d.dim() == 2:

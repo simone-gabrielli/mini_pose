@@ -172,11 +172,26 @@ def _infer_landmarks_on_crop(
     with torch.no_grad():
         out = model(img_t)
 
-        # Prefer direct coordinate outputs (LOTR) when available.
+        # Prefer LOTR normalized coordinates when available.
+        # Rationale: some checkpoints were trained with data.input_size=192 but
+        # the instantiated model may still have model.input_size=(256,256)
+        # (affecting positional encoding buffers). In that case, LOTR's
+        # `landmarks_pixel` is scaled by model.input_size and becomes
+        # inconsistent with the actual preprocessing resize used here.
+        # Normalized coords remain consistent and we can scale them to the
+        # current resized-crop frame (W_face,H_face).
+        if isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], torch.Tensor):
+            t = out[0]
+            if t.dim() == 3 and t.shape[-1] == 2:
+                coords_norm = t[0].detach().cpu().numpy()  # (N,2) in [0,1]
+                coords_px = coords_norm.copy()
+                coords_px[:, 0] *= float(W_face)
+                coords_px[:, 1] *= float(H_face)
+                return coords_px, (H_face, W_face)
+
+        # Fall back to any explicit pixel outputs (non-LOTR or older exports).
         coords_px = _extract_landmarks_px(out)
         if coords_px is not None:
-            # For coordinate-regression models, there's no heatmap resolution.
-            # Return the pixel frame size that `coords_px` is expressed in.
             return coords_px, (H_face, W_face)
 
         preds_last = _extract_heatmaps_last(out)
@@ -261,26 +276,37 @@ def _load_model_from_config(
         model.load_state_dict(state_dict, strict=bool(strict))
     except RuntimeError as e:
         # Common case: LOTR positional encoding buffer size mismatch because the
-        # config input_size doesn't match the checkpoint's training input.
-        inferred = _infer_input_size_from_pe()
-        if inferred is not None:
+        # checkpoint was saved with a different input_size than the one we want
+        # to use for inference (e.g. cfg.data.input_size=192 but checkpoint PE is
+        # 8x8 from 256). The PE here is *sinusoidal and deterministic*; it is
+        # safe to regenerate it from the current model geometry.
+        sd = dict(state_dict)
+        dropped_pe = sd.pop("pos_encoding.pe", None)
+        if dropped_pe is not None:
             try:
-                model = _build_model({"input_size": inferred})
-                model.load_state_dict(state_dict, strict=bool(strict))
+                model.load_state_dict(sd, strict=False)
+                print(
+                    "[WARN] Dropped checkpoint pos_encoding.pe due to size mismatch; "
+                    "using regenerated sinusoidal PE from config/model input_size."
+                )
             except RuntimeError:
-                # Fall through to drop PE
-                model = _build_model({"input_size": inferred})
-                sd = dict(state_dict)
-                sd.pop("pos_encoding.pe", None)
-                model.load_state_dict(sd, strict=False)
+                # If there are other incompatibilities, fall back to the
+                # previous behavior (rebuild from PE-inferred size).
+                inferred = _infer_input_size_from_pe()
+                if inferred is not None:
+                    try:
+                        model = _build_model({"input_size": inferred})
+                        model.load_state_dict(state_dict, strict=bool(strict))
+                    except RuntimeError:
+                        model = _build_model({"input_size": inferred})
+                        sd2 = dict(state_dict)
+                        sd2.pop("pos_encoding.pe", None)
+                        model.load_state_dict(sd2, strict=False)
+                else:
+                    raise e
         else:
-            # As a last resort: drop the positional encoding tensor and load non-strict.
-            sd = dict(state_dict)
-            if "pos_encoding.pe" in sd:
-                sd.pop("pos_encoding.pe", None)
-                model.load_state_dict(sd, strict=False)
-            else:
-                raise e
+            # No PE key to drop; re-raise.
+            raise e
 
     # Optional: apply EMA weights (common for 'best.pth' checkpoints)
     # Trainer saves EMA state under ckpt['ema']['shadow'] and (optionally) evaluates using EMA.
@@ -497,7 +523,15 @@ def main():
 
     if hasattr(model, "input_size"):
         try:
-            print(f"Loaded model: {type(model).__name__} model.input_size={getattr(model, 'input_size')}")
+            if args.config and cfg is not None:
+                data_cfg = (cfg or {}).get("data", {})
+                cfg_is = data_cfg.get("input_size") if isinstance(data_cfg, dict) else None
+                print(
+                    f"Loaded model: {type(model).__name__} model.input_size={getattr(model, 'input_size')} "
+                    f"cfg.data.input_size={cfg_is}"
+                )
+            else:
+                print(f"Loaded model: {type(model).__name__} model.input_size={getattr(model, 'input_size')}")
         except Exception:
             print(f"Loaded model: {type(model).__name__} (input_size unreadable)")
     else:
@@ -567,12 +601,14 @@ def main():
         )
 
         # map from resized crop coords -> original image coords
-        # pred_px is expressed in the pixel space returned by _infer_landmarks_on_crop
-        # (for LOTR: model.input_size; for heatmaps: resized crop size).
-        H_pred, W_pred = pred_space
-        W_face, H_face = int(W_pred), int(H_pred)
-        scale_x = (x2 - x1) / float(W_face)
-        scale_y = (y2 - y1) / float(H_face)
+        # pred_px is returned in *resized crop* pixel space (width, height) —
+        # irrespective of whether the model produced direct coords or was decoded
+        # from heatmaps. Use the preprocessing `input_size` (W,H) used above to
+        # determine the resize scale rather than trusting `pred_space` which may
+        # contain heatmap dimensions.
+        W_resized, H_resized = int(input_size[0]), int(input_size[1])
+        scale_x = (x2 - x1) / float(W_resized)
+        scale_y = (y2 - y1) / float(H_resized)
         pred_orig = pred_px.copy()
         pred_orig[:, 0] = pred_orig[:, 0] * scale_x + x1
         pred_orig[:, 1] = pred_orig[:, 1] * scale_y + y1
