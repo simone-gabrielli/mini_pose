@@ -196,20 +196,6 @@ def convert_300w3d(root, out_dir,
                 if bbox_w <= 0 or bbox_h <= 0:
                     continue
 
-                # ----------------- 3D keypoints (if possible) -----------------
-                keypoints_3d = None
-                if "Exp_Para" in mat:
-                    try:
-                        exp_para = mat["Exp_Para"]  # (29, 1)
-                        lm3d = reconstruct_3d_landmarks(exp_para, model_3dmm)  # (68, 3)
-
-                        keypoints_3d = []
-                        for x3, y3, z3 in lm3d:
-                            keypoints_3d.extend([float(x3), float(y3), float(z3), 2.0])
-                    except Exception as e:
-                        # If reconstruction fails for some reason, just skip 3D for this sample
-                        keypoints_3d = None
-
                 # ----------------- Store image entry -----------------
                 images.append({
                     "id": img_id,
@@ -217,13 +203,6 @@ def convert_300w3d(root, out_dir,
                     "width": int(w),
                     "height": int(h)
                 })
-
-                # ----------------- Store all 3D-related parameters -----------------
-                extra_3d = {}
-                for k in ["Shape_Para", "Exp_Para", "Pose_Para",
-                          "Tex_Para", "Illum_Para", "Color_Para", "roi"]:
-                    if k in mat:
-                        extra_3d[k] = np.asarray(mat[k]).tolist()
 
                 ann = {
                     "id": ann_id,
@@ -234,11 +213,7 @@ def convert_300w3d(root, out_dir,
                     "bbox": [x_min, y_min, bbox_w, bbox_h],
                     "area": bbox_w * bbox_h,
                     "iscrowd": 0,
-                    "parameters_3d": extra_3d
                 }
-
-                if keypoints_3d is not None:
-                    ann["keypoints_3d"] = keypoints_3d
 
                 annotations.append(ann)
 
