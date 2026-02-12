@@ -80,15 +80,33 @@ data:
     rotation: 30
     scale: 0.15
     color_jitter: 0.15
-    aug_factor: 1
+    aug_factor: 2
     content:
-      brightness_contrast_p: 0.5
+      brightness_contrast_p: 0.6
       sunflare_p: 0.1
-      motion_blur_p: 0.1
-      gauss_noise_p: 0.2
+      motion_blur_p: 0.15
+      gauss_noise_p: 0.25
       gauss_noise_var: [10.0, 50.0]
-      compression_p: 0.2
+      compression_p: 0.25
       compression_quality: [60, 100]
+      clahe_p: 0.10
+      gamma_p: 0.15
+      hsv_p: 0.15
+      rgb_shift_p: 0.10
+      shadow_p: 0.10
+      fog_p: 0.03
+      blur_p: 0.10
+      coarse_dropout_p: 0.10
+
+    occlusion:
+      p: 0.35
+      within_bbox: true
+      max_holes: 3
+      min_area: 0.02
+      max_area: 0.20
+      min_aspect: 0.3
+      max_aspect: 3.0
+      fill_mode: random
 
   # val_aug:
   #   enabled: false

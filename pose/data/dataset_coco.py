@@ -57,6 +57,7 @@ class CocoKeypointsDataset(Dataset):
             scale=aug_cfg.get("scale", 0.10),
             color_jitter=aug_cfg.get("color_jitter", 0.15),
             content_cfg=aug_cfg.get("content", None),
+            occlusion_cfg=aug_cfg.get("occlusion", None),
         )
 
         # Augmentation factor: replicate annotation entries to increase dataset size
