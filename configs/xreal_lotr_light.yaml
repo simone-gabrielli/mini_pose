@@ -6,7 +6,7 @@ seed: 42
 
 data:
   type: coco_keypoints
-  input_size: [192, 192]      # Smaller input for speed
+  input_size: [256, 256]      # Smaller input for speed
   # Not heatmap based, so no heatmap_size or sigma needed
 
   batch_size: 16
@@ -43,6 +43,9 @@ data:
     enabled: true
     use_bbox_crop: true
     face_margin: 0.5
+    bbox_offset_p: 0.25
+    bbox_offset_max_frac: 0.5
+    keep_oob_visible: true
     hflip_p: 0.5
     flip_pairs:
       - [0, 9]
@@ -125,6 +128,7 @@ model:
   dropout: 0.1
   use_upsampling: false      # Skip upsampling for speed
   pretrained: true
+  constrain_coords: false
 
 loss:
   name: smooth_wing
@@ -133,7 +137,7 @@ loss:
   t: 2.0
 
 train:
-  epochs: 200
+  epochs: 250
   optimizer:
     name: adam
     lr: 0.0002

@@ -37,6 +37,8 @@ data:
     enabled: true
     use_bbox_crop: false
     face_margin: 0.25
+    bbox_offset_p: 0.25
+    bbox_offset_max_frac: 0.5
     hflip_p: 0.5
     rotation: 10
     scale: 0.15

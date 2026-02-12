@@ -45,6 +45,9 @@ data:
     enabled: true
     use_bbox_crop: true
     face_margin: 0.5
+    bbox_offset_p: 0.25
+    bbox_offset_max_frac: 0.5
+    keep_oob_visible: true
     hflip_p: 0.5
     flip_pairs:
       - [0, 9]
@@ -130,6 +133,7 @@ model:
   use_upsampling: true
   upsampling_layers: 2       # 2 layers = 4x upsampling (8x8 -> 32x32)
   pretrained: true
+  constrain_coords: false
 
 loss:
   name: smooth_wing

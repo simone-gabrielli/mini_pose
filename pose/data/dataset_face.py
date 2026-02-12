@@ -82,6 +82,7 @@ class CocoFaceDataset(Dataset):
             color_jitter=aug_cfg.get("color_jitter", 0.15),
             content_cfg=aug_cfg.get("content", None),
             occlusion_cfg=aug_cfg.get("occlusion", None),
+            keep_oob_visible=bool(aug_cfg.get("keep_oob_visible", False)),
         )
 
         # Augmentation factor: replicate items to enlarge training set

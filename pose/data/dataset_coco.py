@@ -48,6 +48,11 @@ class CocoKeypointsDataset(Dataset):
         # augmentations.
         self.use_bbox_crop = bool(aug_cfg.get("use_bbox_crop", False))
         self.face_margin = float(aug_cfg.get("face_margin", 0.25))
+        # Randomly offset the crop window center to simulate imperfect framing
+        # (e.g., camera cuts off parts of the face). The max offset is expressed
+        # as a fraction of the crop size.
+        self.bbox_offset_p = float(aug_cfg.get("bbox_offset_p", 0.0))
+        self.bbox_offset_max_frac = float(aug_cfg.get("bbox_offset_max_frac", 0.5))
         self.transform = AlbumentationsKeypointPipeline(
             input_size=input_size,
             enabled=bool(aug_cfg.get("enabled", True)),
@@ -58,6 +63,7 @@ class CocoKeypointsDataset(Dataset):
             color_jitter=aug_cfg.get("color_jitter", 0.15),
             content_cfg=aug_cfg.get("content", None),
             occlusion_cfg=aug_cfg.get("occlusion", None),
+            keep_oob_visible=bool(aug_cfg.get("keep_oob_visible", False)),
         )
 
         # Augmentation factor: replicate annotation entries to increase dataset size
@@ -108,6 +114,15 @@ class CocoKeypointsDataset(Dataset):
             cx = x + w / 2.0
             cy = y + h / 2.0
             size = max(w, h) * (1.0 + self.face_margin)
+
+            # Random offset of the crop center.
+            if self.bbox_offset_p > 0 and np.random.rand() < self.bbox_offset_p:
+                max_frac = max(0.0, min(float(self.bbox_offset_max_frac), 0.5))
+                max_off = float(size) * max_frac
+                dx = np.random.uniform(-max_off, max_off)
+                dy = np.random.uniform(-max_off, max_off)
+                cx += dx
+                cy += dy
             x1 = int(cx - size / 2.0)
             y1 = int(cy - size / 2.0)
             x2 = int(cx + size / 2.0)

@@ -185,10 +185,12 @@ class AlbumentationsKeypointPipeline:
         bbox_safe=True,
         content_cfg: dict | None = None,
         occlusion_cfg: dict | None = None,
+        keep_oob_visible: bool = False,
     ):
         self.input_size = input_size
         self.enabled = bool(enabled)
         self.hflip_p = float(hflip_p) if self.enabled else 0.0
+        self.keep_oob_visible = bool(keep_oob_visible)
 
         # Normalize flip_pairs to a list[tuple[int,int]]
         self.flip_pairs: list[tuple[int, int]] | None = None
@@ -506,9 +508,9 @@ class AlbumentationsKeypointPipeline:
 
             if vis is not None:
                 orig_vis = (vis[:, 0] > 0).astype(np.bool_)
-                merged = (orig_vis & in_bounds)
+                merged = orig_vis if self.keep_oob_visible else (orig_vis & in_bounds)
             else:
-                merged = in_bounds
+                merged = np.ones_like(in_bounds, dtype=np.bool_) if self.keep_oob_visible else in_bounds
 
             if occluded_mask is not None and occluded_mask.shape[0] == merged.shape[0]:
                 merged = merged & (~occluded_mask)

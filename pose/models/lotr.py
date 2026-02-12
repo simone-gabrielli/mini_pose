@@ -245,7 +245,8 @@ class LandmarkPredictionHead(nn.Module):
         hidden_dim: int = 512,
         num_hidden_layers: int = 2,
         output_dim: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        constrain_coords: bool = True,
     ):
         super().__init__()
         
@@ -261,6 +262,10 @@ class LandmarkPredictionHead(nn.Module):
         layers.append(nn.Linear(hidden_dim, output_dim))
         
         self.mlp = nn.Sequential(*layers)
+
+        # When True, applies sigmoid so coords stay in [0,1].
+        # When False, coords are unconstrained and can go <0 or >1.
+        self.constrain_coords = bool(constrain_coords)
         
         # Initialize final layer with small weights for stable training
         nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.01)
@@ -274,8 +279,8 @@ class LandmarkPredictionHead(nn.Module):
             coords: (B, N, 2) normalized coordinates in [0, 1]
         """
         coords = self.mlp(x)
-        # Apply sigmoid to constrain to [0, 1] range
-        coords = torch.sigmoid(coords)
+        if self.constrain_coords:
+            coords = torch.sigmoid(coords)
         return coords
 
 
@@ -358,6 +363,7 @@ class LOTR(PoseModel):
         upsampling_layers: int = 2,
         pretrained: bool = True,
         input_size: Tuple[int, int] = (256, 256),
+        constrain_coords: bool = True,
         prediction_output_dim: int = 2,  # 2 for 2D, 3 for 3D landmarks
         **kwargs  # Accept extra kwargs for compatibility
     ):
@@ -427,7 +433,8 @@ class LOTR(PoseModel):
             hidden_dim=dim_feedforward,
             num_hidden_layers=2,
             output_dim=prediction_output_dim,
-            dropout=dropout
+            dropout=dropout,
+            constrain_coords=constrain_coords,
         )
         
         self._init_weights()
