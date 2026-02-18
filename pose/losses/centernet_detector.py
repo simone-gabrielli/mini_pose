@@ -208,7 +208,10 @@ class CenterNetDetectorLoss(nn.Module):
         hm_loss_per = _centernet_focal_loss(hm_pred, hm_t, alpha=self.focal_alpha, beta=self.focal_beta)  # (B,)
 
         # Regression losses only for positives
-        wh_pred = F.relu(wh_p)
+        # IMPORTANT: do NOT ReLU/clip wh before loss. If we clamp to 0 here,
+        # negative predictions get zero gradient and the head can get stuck
+        # outputting ~0 widths (shows up as x1==x2 in visualizations).
+        wh_pred = wh_p
         off_pred = torch.sigmoid(off_p)
         wh_g = _gather_feat(wh_pred, ind)  # (B,2)
         off_g = _gather_feat(off_pred, ind)  # (B,2)
