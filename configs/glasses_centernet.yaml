@@ -1,0 +1,111 @@
+experiment: glasses_centernet
+seed: 1337
+
+data:
+  type: coco_face
+  # Higher res than tiny_face helps with glasses precision while staying fast.
+  input_size: [256, 256]
+
+  batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+
+  train_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.4
+
+  primary_val: hmd_xreal
+  val_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.2
+
+  aug:
+    enabled: true
+    hflip_p: 0.5
+    rotation: 10
+    scale: 0.20
+    color_jitter: 0.20
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.6
+      sunflare_p: 0.10
+      motion_blur_p: 0.20
+      gauss_noise_p: 0.25
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
+      clahe_p: 0.05
+      gamma_p: 0.10
+      hsv_p: 0.10
+      rgb_shift_p: 0.05
+      shadow_p: 0.05
+      fog_p: 0.0
+      blur_p: 0.05
+      coarse_dropout_p: 0.0
+    occlusion:
+      p: 0.25
+      within_bbox: true
+      max_holes: 2
+      min_area: 0.02
+      max_area: 0.15
+      min_aspect: 0.3
+      max_aspect: 3.0
+      fill_mode: random
+
+model:
+  name: centernet_single
+  backbone: mobilenet_v3_small
+  width_mult: 1.0
+  pretrained: true
+  neck_ch: 256
+  head_ch: 64
+  num_deconv: 3
+  down_ratio: 4
+
+loss:
+  name: centernet_detector
+  hm_weight: 1.0
+  wh_weight: 0.1
+  off_weight: 1.0
+  min_overlap: 0.7
+  min_radius: 0
+  max_radius: 8
+  focal_alpha: 2.0
+  focal_beta: 4.0
+
+train:
+  epochs: 120
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    weight_decay: 0.0005
+  scheduler:
+    name: cosine_warmup
+    warmup_epochs: 3
+    warmup_start_factor: 0.1
+    min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp:
+    enabled: true
+    dtype: fp16
+  ema:
+    enabled: true
+    decay: 0.999
+    update_every: 1
+    eval: true
+  num_val_viz: 4
+  output_dir: "work_dirs/glasses_centernet"
