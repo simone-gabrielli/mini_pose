@@ -190,7 +190,7 @@ def parse_args():
     p.add_argument(
         "--bbox_from_glasses_landmarks",
         action="store_true",
-        default=False,
+        default=True,
         help="If set, recompute COCO bbox/area from the projected glasses keypoints (visible ones only). "
              "If no visible glasses keypoints exist for an annotation, falls back to the original bbox/area.",
     )
