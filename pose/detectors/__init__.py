@@ -1,2 +1,1 @@
 from .face_detector import TinyFaceDetector
-from .centernet_detector import CenterNetSingleDetector
