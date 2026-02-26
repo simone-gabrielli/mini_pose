@@ -55,6 +55,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use strict checkpoint loading (only applies when --config is set).",
     )
     parser.add_argument(
+        "--ema",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="EMA weights usage when checkpoint contains EMA state (auto follows config train.ema.eval).",
+    )
+    parser.add_argument(
         "--face-margin",
         type=float,
         default=50.0,
@@ -80,7 +86,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to TinyFace detector checkpoint (.pth). If omitted, uses ImageNet-pretrained backbone weights.",
     )
-    parser.add_argument("--tinyface-input", type=int, default=256, help="TinyFace detector square input size")
+    parser.add_argument(
+        "--tinyface-input",
+        type=int,
+        default=192,
+        help="TinyFace detector square input size (defaults to 192 to match training configs)",
+    )
 
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--max-faces", type=int, default=4)
@@ -335,6 +346,7 @@ def _load_model_from_config(
     fallback_num_keypoints: int,
     weights_only: bool,
     strict: bool,
+    ema_mode: str = "auto",
 ):
     """Load a model using the same generic config wiring as Trainer.
 
@@ -411,6 +423,49 @@ def _load_model_from_config(
             else:
                 raise e
 
+    # Optional: apply EMA weights (common for 'best.pth' checkpoints)
+    # Trainer saves EMA state under ckpt['ema']['shadow'] and (optionally) evaluates using EMA.
+    ema_shadow = None
+    if isinstance(ckpt, dict):
+        ema_state = ckpt.get("ema")
+        if isinstance(ema_state, dict):
+            shadow = ema_state.get("shadow")
+            if isinstance(shadow, dict):
+                ema_shadow = shadow
+
+    def _should_use_ema() -> bool:
+        mode = str(ema_mode).lower().strip() if ema_mode is not None else "auto"
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        # auto: follow config if present, else use EMA when available
+        ema_cfg = (cfg.get("train", {}) or {}).get("ema", {}) or {}
+        return bool(ema_cfg.get("eval", True))
+
+    if ema_shadow is not None and _should_use_ema():
+        # `ema_shadow` is a dict of parameter tensors only (Trainer.ModelEMA).
+        # Apply it the same way as Trainer does: copy matching parameters by name.
+        applied = 0
+        try:
+            for name, p in model.named_parameters():
+                if name not in ema_shadow:
+                    continue
+                if not torch.is_floating_point(p.data):
+                    continue
+                src = ema_shadow[name]
+                if not isinstance(src, torch.Tensor):
+                    continue
+                if src.device != p.device:
+                    src = src.to(device=p.device)
+                p.data.copy_(src)
+                applied += 1
+        except Exception as e:
+            print(f"[WARN] Failed to apply EMA shadow weights: {e}")
+        else:
+            if applied > 0:
+                print(f"Using EMA weights for inference (applied {applied} params)")
+
     model.to(device)
     model.eval()
     return model, cfg, num_keypoints
@@ -428,26 +483,33 @@ def _extract_preds_last(model_out: object) -> torch.Tensor:
     raise TypeError(f"Unsupported model output type for heatmaps: {type(model_out)}")
 
 
-def _try_extract_coords_batch(model_out: object) -> torch.Tensor | None:
-    """Try to extract a (B, K, 2) coordinate tensor from a model output.
+def _try_extract_norm_coords_batch(model_out: object) -> torch.Tensor | None:
+    """Try to extract NORMALIZED (B, K, 2) coordinate tensor from a LOTR-style model output.
 
     Supports LOTR-style outputs:
-      - (landmarks_norm, landmarks_pixel) where landmarks_pixel is (B, K, 2) or (B, K, 3)
+      - (landmarks_norm, landmarks_pixel) where landmarks_norm is (B, K, 2)
+
+    Using the normalized coordinates (element [0]) avoids any dependency on
+    model.input_size and is consistent with how the Trainer computes the loss:
+        preds_2d = landmarks_norm * [W_in, H_in]
+
+    The caller must scale by the actual preprocessing size to get pixel coords.
+
     Returns:
-      - coords_px: (B, K, 2) float tensor in crop pixel space, or None if not applicable.
+      - coords_norm: (B, K, 2) float tensor in [0,1] normalized space, or None.
     """
     if not isinstance(model_out, tuple):
         return None
     if len(model_out) < 2:
         return None
-    coords = model_out[1]
-    if not isinstance(coords, torch.Tensor):
+    coords_norm = model_out[0]
+    if not isinstance(coords_norm, torch.Tensor):
         return None
-    if coords.dim() != 3:
+    if coords_norm.dim() != 3:
         return None
-    if coords.size(-1) < 2:
+    if coords_norm.size(-1) < 2:
         return None
-    return coords[..., :2]
+    return coords_norm[..., :2]
 
 
 def build_detector(
@@ -457,8 +519,9 @@ def build_detector(
     score_thresh: float = 0.4,
     yunet_model: str | None = None,
     tinyface_checkpoint: str | None = None,
-    tinyface_input: int = 256,
+    tinyface_input: int = 192,
     fp16: bool = False,
+    ema_mode: str = "auto",
 ):
     def _default_yunet_path() -> str | None:
         # shipped in this repo under scripts/video_test/yunet_detector/
@@ -528,6 +591,7 @@ def build_detector(
         input_size: int = 256,
         conf_th: float = 0.4,
         fp16: bool = False,
+        ema_mode: str = "auto",
     ):
         try:
             from pose.detectors.face_detector import TinyFaceDetector
@@ -556,10 +620,13 @@ def build_detector(
                 out[nk] = v
             return out
 
-        # Instantiate with a matching backbone. For usability we infer the backbone
-        # from the checkpoint (when provided) so we don't need a long list of CLI args.
+        # Instantiate with a matching backbone/head. We infer these from the
+        # checkpoint (when provided) so we don't need a long list of CLI args.
         inferred_backbone = "mobilenet_v2"
+        inferred_embed_dim: int | None = None
+        inferred_deep_head: bool | None = None
         sd = None
+        ema_shadow = None
         if checkpoint_path:
             try:
                 ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -567,26 +634,52 @@ def build_detector(
                 ckpt = torch.load(checkpoint_path, map_location="cpu")
             sd = _strip_module_prefix(_get_state_dict(ckpt))
 
-            # Heuristic: MobileNetV3 checkpoints in torchvision have ".block." keys.
-            # Additionally, v3-small commonly has last_channel=576 (fc in_features).
+            # Many checkpoints are trained/evaluated with EMA. The 'best.pth'
+            # is usually selected using EMA weights, while ckpt['model'] holds
+            # the raw (non-EMA) weights. Use EMA shadow when available.
+            if isinstance(ckpt, dict):
+                ema = ckpt.get("ema")
+                if isinstance(ema, dict):
+                    shadow = ema.get("shadow")
+                    if isinstance(shadow, dict) and shadow:
+                        ema_shadow = _strip_module_prefix(shadow)
+
             try:
+                import re
+
                 keys = list(sd.keys())
-                if any(".block." in k for k in keys):
+
+                # Infer head type: deep_head checkpoints have fc.9.* (final Linear at index 9).
+                inferred_deep_head = any(k.startswith("fc.9.") for k in keys) or any(k.startswith("fc.6.") for k in keys)
+
+                # Infer embed dim from the first Linear in the head.
+                fc1 = sd.get("fc.1.weight")
+                if isinstance(fc1, torch.Tensor) and fc1.dim() == 2:
+                    inferred_embed_dim = int(fc1.shape[0])
+
+                # Infer backbone from feature key structure.
+                # - EfficientNet-B0 (torchvision) has nested blocks: features.<stage>.<block>.block.*
+                # - MobileNetV3 has: features.<idx>.block.*
+                # - MobileNetV2 has: features.<idx>.conv.*
+                if any(re.match(r"^features\.\d+\.\d+\.block\.", k) for k in keys):
+                    inferred_backbone = "efficientnet_b0"
+                elif any(re.match(r"^features\.\d+\.block\.", k) for k in keys):
                     inferred_backbone = "mobilenet_v3_small"
                 else:
-                    w0 = sd.get("features.0.0.weight")
-                    fc1 = sd.get("fc.1.weight")
-                    if isinstance(w0, torch.Tensor) and int(w0.shape[0]) == 16:
-                        inferred_backbone = "mobilenet_v3_small"
-                    if isinstance(fc1, torch.Tensor) and int(fc1.shape[1]) == 576:
-                        inferred_backbone = "mobilenet_v3_small"
+                    inferred_backbone = "mobilenet_v2"
             except Exception:
                 pass
 
-        model = TinyFaceDetector(
-            pretrained=bool(not checkpoint_path),
-            backbone=str(inferred_backbone),
-        )
+        model_kwargs = {
+            "pretrained": bool(not checkpoint_path),
+            "backbone": str(inferred_backbone),
+        }
+        if inferred_embed_dim is not None:
+            model_kwargs["embed_dim"] = int(inferred_embed_dim)
+        if inferred_deep_head is not None:
+            model_kwargs["deep_head"] = bool(inferred_deep_head)
+
+        model = TinyFaceDetector(**model_kwargs)
 
         if checkpoint_path and sd is not None:
             try:
@@ -607,6 +700,34 @@ def build_detector(
                 model = model.half()
             except Exception:
                 pass
+
+        # Optionally apply EMA shadow weights.
+        try:
+            use_ema = str(ema_mode).lower().strip() in {"auto", "on", "true", "1", "yes"}
+        except Exception:
+            use_ema = True
+
+        if use_ema and isinstance(ema_shadow, dict) and ema_shadow:
+            applied = 0
+            for name, p in model.named_parameters():
+                if name not in ema_shadow:
+                    continue
+                t = ema_shadow.get(name)
+                if not isinstance(t, torch.Tensor):
+                    continue
+                if not torch.is_floating_point(p.data):
+                    continue
+                if t.device != p.device:
+                    t = t.to(device=p.device)
+                if t.dtype != p.dtype:
+                    t = t.to(dtype=p.dtype)
+                try:
+                    p.data.copy_(t)
+                    applied += 1
+                except Exception:
+                    continue
+            if applied > 0:
+                print(f"Using TinyFace EMA weights (applied {applied} params)")
 
         class TinyFaceWrapper:
             def __init__(self, model, input_size: int, conf_th: float):
@@ -673,6 +794,7 @@ def build_detector(
             input_size=tinyface_input,
             conf_th=float(score_thresh),
             fp16=fp16,
+            ema_mode=str(ema_mode),
         )
         if det is None:
             raise RuntimeError("TinyFace requested but not available (check pose.detectors.face_detector and dependencies)")
@@ -683,7 +805,13 @@ def build_detector(
     if det is not None:
         print("Using YuNet detector")
         return det
-    det = make_tinyface(tinyface_checkpoint, input_size=tinyface_input, conf_th=float(score_thresh), fp16=fp16)
+    det = make_tinyface(
+        tinyface_checkpoint,
+        input_size=tinyface_input,
+        conf_th=float(score_thresh),
+        fp16=fp16,
+        ema_mode=str(ema_mode),
+    )
     if det is not None:
         print("Using TinyFace detector")
         return det
@@ -722,6 +850,7 @@ def main():
             fallback_num_keypoints=int(args.num_keypoints),
             weights_only=weights_only,
             strict=bool(args.strict),
+            ema_mode=str(args.ema),
         )
         args.num_keypoints = int(cfg_num_keypoints)
     else:
@@ -789,6 +918,7 @@ def main():
         tinyface_checkpoint=args.tinyface_checkpoint,
         tinyface_input=args.tinyface_input,
         fp16=bool(args.fp16),
+        ema_mode=str(args.ema),
     )
 
     frame_idx = 0
@@ -995,11 +1125,14 @@ def main():
 
                     # Decode either coordinate-regression outputs (LOTR) or heatmaps.
                     t0 = perf_counter() if args.profile else None
-                    coords_batch = _try_extract_coords_batch(preds)
+                    coords_norm_batch = _try_extract_norm_coords_batch(preds)
 
-                    if coords_batch is not None:
-                        # (B, K, 2) in resized crop pixel space
-                        coords_batch = coords_batch.detach().float().cpu().numpy()
+                    if coords_norm_batch is not None:
+                        # (B, K, 2) in NORMALIZED [0,1] space. Scale by the
+                        # actual preprocessing size to get crop-pixel coords,
+                        # matching how the Trainer computes preds_2d during
+                        # training (landmarks_norm * [W_in, H_in]).
+                        coords_norm_batch = coords_norm_batch.detach().float().cpu().numpy()
                         if args.profile:
                             prof["to_cpu"] += perf_counter() - t0
 
@@ -1008,13 +1141,17 @@ def main():
                         W_face = float(preprocess_size[0])
                         H_face = float(preprocess_size[1])
                         debug_inputs = []
-                        for i in range(coords_batch.shape[0]):
-                            coords = coords_batch[i]
+                        for i in range(coords_norm_batch.shape[0]):
+                            coords = coords_norm_batch[i].copy()
+                            # Normalized -> crop pixel space
+                            coords[:, 0] *= W_face
+                            coords[:, 1] *= H_face
                             if args.show_input_crops and i < len(face_inputs_bgr):
                                 dbg = face_inputs_bgr[i].copy()
                                 draw_landmarks(dbg, coords, color=(0, 0, 255))
                                 cv2.putText(dbg, f"face {i}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                                 debug_inputs.append(dbg)
+                            # Crop pixel space -> full frame pixel space
                             x1, y1, x2, y2 = boxes_clamped[i]
                             scale_x = (x2 - x1) / W_face
                             scale_y = (y2 - y1) / H_face

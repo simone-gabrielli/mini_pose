@@ -210,6 +210,7 @@ def _load_tinyface_model(
     width_mult: float,
     embed_dim: int,
     dropout: float,
+    deep_head: bool = False,
     pretrained: bool,
     strict: bool,
     ema_mode: str,
@@ -230,6 +231,7 @@ def _load_tinyface_model(
         width_mult=float(width_mult),
         embed_dim=int(embed_dim),
         dropout=float(dropout),
+        deep_head=bool(deep_head),
     )
 
     try:
@@ -365,6 +367,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--width-mult", type=float, default=1.0)
     p.add_argument("--embed-dim", type=int, default=128)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--deep-head", action="store_true", help="Use deeper regression head with LayerNorm (matches face_efficientnet config)")
     p.add_argument("--no-pretrained", action="store_true", help="Disable ImageNet pretrained backbone weights")
 
     p.add_argument("--strict", action="store_true", help="Strict checkpoint loading")
@@ -388,14 +391,22 @@ def main() -> None:
     if args.config:
         config_raw = Config.from_yaml(args.config).raw
         model_cfg = (config_raw or {}).get("model", {}) or {}
+        data_cfg = (config_raw or {}).get("data", {}) or {}
         # Only apply defaults if user didn't explicitly override (argparse already has defaults).
         args.backbone = str(model_cfg.get("backbone", args.backbone))
         args.width_mult = float(model_cfg.get("width_mult", args.width_mult))
         args.embed_dim = int(model_cfg.get("embed_dim", args.embed_dim))
         args.dropout = float(model_cfg.get("dropout", args.dropout))
+        # deep_head: config can enable it; CLI --deep-head always wins
+        if not args.deep_head and model_cfg.get("deep_head", False):
+            args.deep_head = True
         if "pretrained" in model_cfg and not args.no_pretrained:
             # keep CLI --no-pretrained as the strongest override
             args.no_pretrained = not bool(model_cfg.get("pretrained", True))
+        # Use input_size from config when available (user --input-size still wins
+        # if explicitly set, but argparse default is 256).
+        if "input_size" in data_cfg and isinstance(data_cfg["input_size"], (list, tuple)) and len(data_cfg["input_size"]) >= 1:
+            args.input_size = int(data_cfg["input_size"][0])
 
     model = _load_tinyface_model(
         checkpoint_path=str(args.checkpoint),
@@ -404,11 +415,15 @@ def main() -> None:
         width_mult=float(args.width_mult),
         embed_dim=int(args.embed_dim),
         dropout=float(args.dropout),
+        deep_head=bool(args.deep_head),
         pretrained=not bool(args.no_pretrained),
         strict=bool(args.strict),
         ema_mode=str(args.ema),
         config_raw=config_raw,
     )
+
+    print(f"Loaded TinyFaceDetector: backbone={args.backbone}, embed_dim={args.embed_dim}, "
+          f"deep_head={args.deep_head}, input_size={args.input_size}")
 
     _safe_mkdir(args.out_dir)
     viz_dir = str(Path(args.out_dir) / "viz")

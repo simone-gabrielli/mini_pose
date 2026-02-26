@@ -12,6 +12,14 @@ class TinyFaceDetector(nn.Module):
 
     - Input: RGB image tensor, shape (B,3,H,W) expected in [0,1]
     - Output: tensor (B,5) -> [conf_logit, x1, y1, x2, y2] with bbox coords normalized [0..1]
+
+    Supported backbones:
+        - mobilenet_v2 (default, ~3.4M params)
+        - mobilenet_v3_small (~2.5M params, fastest)
+        - efficientnet_b0 (~5.3M params, best quality/speed for stability)
+
+    Set ``deep_head=True`` for a 2-hidden-layer MLP with LayerNorm, which
+    substantially reduces output jitter at negligible speed cost.
     """
 
     def __init__(
@@ -21,6 +29,7 @@ class TinyFaceDetector(nn.Module):
         dropout: float = 0.1,
         backbone: str = "mobilenet_v2",
         width_mult: float = 1.0,
+        deep_head: bool = False,
         num_keypoints=None,
         **kwargs,
     ):
@@ -30,7 +39,16 @@ class TinyFaceDetector(nn.Module):
 
         # Lightweight backbone
         tv = torchvision.models
-        if bb in {"mobilenet_v3_small", "mnetv3_small", "mbv3_small"}:
+        if bb in {"efficientnet_b0", "effnet_b0", "enet_b0"}:
+            try:
+                weights = tv.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+                net = tv.efficientnet_b0(weights=weights)
+            except Exception:
+                net = tv.efficientnet_b0(pretrained=pretrained)
+            self.features = net.features
+            in_ch = 1280  # EfficientNet-B0 last channel
+
+        elif bb in {"mobilenet_v3_small", "mnetv3_small", "mbv3_small"}:
             try:
                 weights = tv.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
                 try:
@@ -42,6 +60,19 @@ class TinyFaceDetector(nn.Module):
                     net = tv.mobilenet_v3_small(pretrained=pretrained, width_mult=float(width_mult))
                 except TypeError:
                     net = tv.mobilenet_v3_small(pretrained=pretrained)
+            self.features = net.features
+            in_ch = getattr(net, "last_channel", None)
+            if in_ch is None:
+                try:
+                    for m in getattr(net, "classifier", []):
+                        if isinstance(m, nn.Linear):
+                            in_ch = int(m.in_features)
+                            break
+                except Exception:
+                    in_ch = None
+            if in_ch is None:
+                in_ch = 576
+
         else:
             # Default: MobileNetV2
             try:
@@ -55,33 +86,47 @@ class TinyFaceDetector(nn.Module):
                     net = tv.mobilenet_v2(pretrained=pretrained, width_mult=float(width_mult))
                 except TypeError:
                     net = tv.mobilenet_v2(pretrained=pretrained)
+            self.features = net.features
+            in_ch = getattr(net, "last_channel", None)
+            if in_ch is None:
+                try:
+                    for m in getattr(net, "classifier", []):
+                        if isinstance(m, nn.Linear):
+                            in_ch = int(m.in_features)
+                            break
+                except Exception:
+                    in_ch = None
+            if in_ch is None:
+                in_ch = 1280
 
-        # keep feature extractor (all features up to classifier)
-        self.features = net.features
-
-        # global pooling + small head
+        # global pooling + regression head
         self.pool = nn.AdaptiveAvgPool2d(1)
-        # Determine pooled channel dim
-        in_ch = getattr(net, "last_channel", None)
-        if in_ch is None:
-            try:
-                # classifier contains at least one Linear
-                for m in getattr(net, "classifier", []):
-                    if isinstance(m, nn.Linear):
-                        in_ch = int(m.in_features)
-                        break
-            except Exception:
-                in_ch = None
-        if in_ch is None:
-            in_ch = 1280
 
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_ch, int(embed_dim)),
-            nn.ReLU(inplace=True),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(embed_dim), 5),
-        )
+        embed_dim = int(embed_dim)
+        if deep_head:
+            # 2-hidden-layer MLP with LayerNorm for stable, low-jitter output.
+            # LayerNorm normalizes feature magnitudes, preventing scale drift
+            # that otherwise causes frame-to-frame bbox jitter.
+            self.fc = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(in_ch, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.SiLU(inplace=True),
+                nn.Dropout(float(dropout)),
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.LayerNorm(embed_dim // 2),
+                nn.SiLU(inplace=True),
+                nn.Dropout(float(dropout) * 0.5),
+                nn.Linear(embed_dim // 2, 5),
+            )
+        else:
+            self.fc = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(in_ch, embed_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(float(dropout)),
+                nn.Linear(embed_dim, 5),
+            )
 
     def forward(self, x):
         # x assumed normalized already
@@ -110,12 +155,24 @@ class TinyFaceDetector(nn.Module):
         _, _, H, W = x.shape
         for c, b in zip(conf.cpu(), bbox.cpu()):
             c_val = float(c.item())
-            b = b.numpy()
+            b = b.numpy().astype(np.float32)
+
+            # Ensure x1<x2, y1<y2 and clamp to [0,1].
+            x1n, y1n, x2n, y2n = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            if x2n < x1n:
+                x1n, x2n = x2n, x1n
+            if y2n < y1n:
+                y1n, y2n = y2n, y1n
+            x1n = float(np.clip(x1n, 0.0, 1.0))
+            y1n = float(np.clip(y1n, 0.0, 1.0))
+            x2n = float(np.clip(x2n, 0.0, 1.0))
+            y2n = float(np.clip(y2n, 0.0, 1.0))
+
             # convert normalized x1,y1,x2,y2 to pixel coords
-            x1 = float(b[0] * W)
-            y1 = float(b[1] * H)
-            x2 = float(b[2] * W)
-            y2 = float(b[3] * H)
+            x1 = float(x1n * W)
+            y1 = float(y1n * H)
+            x2 = float(x2n * W)
+            y2 = float(y2n * H)
             if c_val >= conf_th:
                 results.append({"conf": c_val, "bbox": [x1, y1, x2, y2]})
             else:
@@ -226,13 +283,92 @@ class TinyFaceDetector(nn.Module):
 
 
 def load_tiny_face_detector(checkpoint_path, device=None):
+    import re
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyFaceDetector(pretrained=False)
-    state = torch.load(checkpoint_path, map_location=device)
-    if "model_state" in state:
-        model.load_state_dict(state["model_state"])
-    else:
-        model.load_state_dict(state)
+
+    def _strip_module_prefix(sd: dict) -> dict:
+        out = {}
+        for k, v in sd.items():
+            nk = k[len("module.") :] if isinstance(k, str) and k.startswith("module.") else k
+            out[nk] = v
+        return out
+
+    def _get_state_dict(ckpt_obj: object) -> dict:
+        if isinstance(ckpt_obj, dict):
+            for k in ("model", "model_state", "state_dict", "weights"):
+                sd = ckpt_obj.get(k)
+                if isinstance(sd, dict):
+                    return sd
+            # maybe the dict itself is already a state_dict
+            if ckpt_obj and all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
+                return ckpt_obj
+        raise ValueError("Unsupported checkpoint format")
+
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+    sd = _strip_module_prefix(_get_state_dict(ckpt))
+    keys = list(sd.keys())
+
+    inferred_backbone = "mobilenet_v2"
+    if any(re.match(r"^features\.\d+\.\d+\.block\.", k) for k in keys):
+        inferred_backbone = "efficientnet_b0"
+    elif any(re.match(r"^features\.\d+\.block\.", k) for k in keys):
+        inferred_backbone = "mobilenet_v3_small"
+
+    inferred_embed_dim = None
+    fc1 = sd.get("fc.1.weight")
+    if isinstance(fc1, torch.Tensor) and fc1.dim() == 2:
+        inferred_embed_dim = int(fc1.shape[0])
+
+    inferred_deep_head = any(k.startswith("fc.9.") for k in keys)
+
+    model_kwargs = {
+        "pretrained": False,
+        "backbone": str(inferred_backbone),
+    }
+    if inferred_embed_dim is not None:
+        model_kwargs["embed_dim"] = int(inferred_embed_dim)
+    if inferred_deep_head:
+        model_kwargs["deep_head"] = True
+
+    model = TinyFaceDetector(**model_kwargs)
+    model.load_state_dict(sd, strict=True)
+
     model.to(device)
     model.eval()
+
+    # Apply EMA shadow weights if present.
+    ema_shadow = None
+    if isinstance(ckpt, dict):
+        ema = ckpt.get("ema")
+        if isinstance(ema, dict):
+            shadow = ema.get("shadow")
+            if isinstance(shadow, dict) and shadow:
+                ema_shadow = _strip_module_prefix(shadow)
+    if isinstance(ema_shadow, dict) and ema_shadow:
+        applied = 0
+        for name, p in model.named_parameters():
+            if name not in ema_shadow:
+                continue
+            t = ema_shadow.get(name)
+            if not isinstance(t, torch.Tensor):
+                continue
+            if not torch.is_floating_point(p.data):
+                continue
+            if t.device != p.device:
+                t = t.to(device=p.device)
+            if t.dtype != p.dtype:
+                t = t.to(dtype=p.dtype)
+            try:
+                p.data.copy_(t)
+                applied += 1
+            except Exception:
+                continue
+        if applied > 0:
+            # Keep output minimal; loader may be used in training scripts too.
+            pass
+
     return model

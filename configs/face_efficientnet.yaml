@@ -1,0 +1,125 @@
+# Stable single-face bbox detector — EfficientNet-B0 + CIoU.
+#
+# Designed for maximum bbox stability (minimal frame-to-frame jitter)
+# at sub-5 ms inference on modern GPUs (192×192 input).
+#
+# Key differences vs face_mobilenet:
+#   1. EfficientNet-B0 backbone — richer features, still ~1-2 ms at 192²
+#   2. CIoU bbox loss — penalizes center-distance + aspect-ratio drift
+#      simultaneously, producing geometrically meaningful gradients
+#   3. Deep head with LayerNorm — prevents feature-scale drift that
+#      causes frame-to-frame output jitter
+#   4. EMA enabled — exponential moving average of weights for smoother
+#      inference parameters
+#   5. Confidence label smoothing — improves calibration, reduces
+#      overconfident oscillation
+
+experiment: face_efficientnet
+seed: 1337
+
+data:
+  type: coco_face
+  input_size: [192, 192]
+
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 0
+
+  train_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/train.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.4
+
+  primary_val: hmd_xreal
+  val_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+    - name: 300w_xreal_air2
+      json_path: "datasets/300W-xreal_air2/annotations/val.json"
+      image_root: "datasets/300W-xreal_air2"
+      weight: 0.2
+
+  aug:
+    enabled: true
+    use_bbox_crop: false
+    face_margin: 0.25
+    bbox_offset_p: 0.25
+    bbox_offset_max_frac: 0.5
+    hflip_p: 0.5
+    rotation: 10
+    scale: 0.15
+    color_jitter: 0.20
+    aug_factor: 1
+    content:
+      brightness_contrast_p: 0.6
+      sunflare_p: 0.10
+      motion_blur_p: 0.20
+      gauss_noise_p: 0.25
+      gauss_noise_var: [10.0, 50.0]
+      compression_p: 0.2
+      compression_quality: [60, 100]
+      clahe_p: 0.05
+      gamma_p: 0.10
+      hsv_p: 0.10
+      rgb_shift_p: 0.05
+      shadow_p: 0.05
+      fog_p: 0.0
+      blur_p: 0.05
+      coarse_dropout_p: 0.0
+
+    occlusion:
+      p: 0.25
+      within_bbox: true
+      max_holes: 2
+      min_area: 0.02
+      max_area: 0.15
+      min_aspect: 0.3
+      max_aspect: 3.0
+      fill_mode: random
+
+model:
+  name: tiny_face
+  backbone: efficientnet_b0
+  pretrained: true
+  embed_dim: 256
+  dropout: 0.1
+  deep_head: true
+
+loss:
+  name: bbox_detector
+  conf_weight: 1.0
+  bbox_weight: 5.0
+  bbox_loss: ciou
+  conf_label_smoothing: 0.02
+
+train:
+  epochs: 120
+  optimizer:
+    name: adamw
+    lr: 0.0002
+    weight_decay: 0.001
+  scheduler:
+    name: cosine_warmup
+    warmup_epochs: 5
+    warmup_start_factor: 0.05
+    min_lr: 0.000001
+  grad_clip_norm: 1.0
+  amp:
+    enabled: true
+    dtype: fp16
+  ema:
+    enabled: true
+    decay: 0.9995
+    update_every: 1
+    eval: true
+  num_val_viz: 4
+  output_dir: "work_dirs/face_efficientnet"
