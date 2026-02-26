@@ -125,10 +125,7 @@ class CenterNetSingleDetector(nn.Module):
 
         out = self.forward(x)
         hm = torch.sigmoid(out["hm"])  # (B,1,H,W)
-        # Softplus keeps sizes positive without hard-clamping to 0.
-        # This avoids "x1==x2" vertical-line boxes in visualizations when the
-        # raw head output is still negative early in training.
-        wh = F.softplus(out["wh"])  # (B,2,H,W) in heatmap units
+        wh = F.relu(out["wh"])  # (B,2,H,W) in heatmap units
         off = torch.sigmoid(out["off"])  # (B,2,H,W) in [0,1]
 
         B, _, Hh, Wh = hm.shape
