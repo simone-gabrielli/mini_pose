@@ -31,7 +31,6 @@ from pose.registry import MODEL_REGISTRY
 
 # Ensure model modules are imported so they register themselves in MODEL_REGISTRY
 import pose.models  # noqa: F401
-import pose.detectors  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -128,52 +127,11 @@ class _OnnxOutputWrapper(torch.nn.Module):
         self.model = model
         self.output_type = str(output_type).lower().strip()
 
-    @staticmethod
-    def _is_tracing_or_export() -> bool:
-        # ONNX export uses tracing; avoid Python-bool checks on symbolic shapes.
-        try:
-            if torch.onnx.is_in_onnx_export():
-                return True
-        except Exception:
-            pass
-        try:
-            if torch.jit.is_tracing():
-                return True
-        except Exception:
-            pass
-        return False
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.model(x)
 
         # Dict outputs
         if isinstance(out, dict):
-            if self.output_type in ("centernet", "centernet5"):
-                hm = out.get("hm")
-                wh = out.get("wh")
-                off = out.get("off")
-                if not (isinstance(hm, torch.Tensor) and isinstance(wh, torch.Tensor) and isinstance(off, torch.Tensor)):
-                    raise TypeError("centernet output-type requires dict outputs with keys: hm, wh, off")
-                if hm.dim() != 4 or wh.dim() != 4 or off.dim() != 4:
-                    raise TypeError("centernet output-type expects 4D tensors (B,C,H,W)")
-                # Only run strict shape/channel checks outside tracing.
-                # During ONNX export, these comparisons can trigger TracerWarning
-                # due to symbolic shapes being treated as tensors.
-                if not self._is_tracing_or_export():
-                    if hm.size(1) != 1 or wh.size(1) != 2 or off.size(1) != 2:
-                        raise TypeError(
-                            f"centernet output-type expects channels (1,2,2); got hm={hm.size(1)} wh={wh.size(1)} off={off.size(1)}"
-                        )
-                    if (
-                        hm.shape[0] != wh.shape[0]
-                        or hm.shape[0] != off.shape[0]
-                        or hm.shape[2:] != wh.shape[2:]
-                        or hm.shape[2:] != off.shape[2:]
-                    ):
-                        raise TypeError("centernet output-type expects matching (B,H,W) across hm/wh/off")
-                # Export raw logits/values; downstream can apply sigmoid/softplus.
-                return torch.cat([hm, wh, off], dim=1)
-
             if self.output_type in ("heatmaps", "auto") and isinstance(out.get("heatmaps"), torch.Tensor):
                 return out["heatmaps"]
             if self.output_type in ("coords_pixel", "auto") and isinstance(out.get("landmarks_pixel"), torch.Tensor):
@@ -253,7 +211,7 @@ def main() -> None:
     parser.add_argument(
         "--output-type",
         default="auto",
-        choices=["auto", "heatmaps", "coords_norm", "coords_pixel", "centernet", "centernet5"],
+        choices=["auto", "heatmaps", "coords_norm", "coords_pixel"],
         help="Which tensor to export when the model returns multiple outputs.",
     )
 
