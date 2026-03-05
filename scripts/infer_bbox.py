@@ -1,10 +1,14 @@
-"""BBox inference helper (TinyFace).
+"""BBox inference helper.
 
 Follows the structure of scripts/infer.py, but targets bbox-only models.
 
 Supports:
 - COCO-style inference via --dataset/--coco-json
 - Plain folder inference via --images-dir
+
+Detectors:
+- tinyface : TinyFace single-box regressor (mobilenet/efficientnet backbones)
+- yolov8   : Ultralytics YOLOv8 detector (useful for glasses detection)
 
 Outputs:
 - Per-image visualizations with predicted bbox (and GT bbox if present)
@@ -41,6 +45,11 @@ except Exception as e:  # pragma: no cover
 
 from pose.config import Config
 from pose.detectors.face_detector import TinyFaceDetector
+
+try:  # optional dependency
+    from pose.detectors.yolov8_detector import YOLOv8Detector
+except Exception:  # pragma: no cover
+    YOLOv8Detector = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -325,13 +334,24 @@ def _draw_bbox_xywh(img_bgr: np.ndarray, bbox_xywh: Tuple[float, float, float, f
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
 
-    p.add_argument("--checkpoint", required=True, help="Trained bbox model checkpoint (e.g. best.pth)")
+    p.add_argument("--detector", choices=["tinyface", "yolov8"], default="tinyface", help="Detection backend")
+    p.add_argument("--checkpoint", default=None, help="TinyFace checkpoint (e.g. best.pth). Required for --detector tinyface")
     p.add_argument(
         "--config",
         default="",
         help="Optional YAML config. If provided, TinyFace backbone/embed_dim/dropout/width_mult will default from it.",
     )
     p.add_argument("--device", default="cuda")
+
+    # YOLOv8 options
+    p.add_argument("--yolo-weights", default=None, help="YOLOv8 weights (.pt). Required for --detector yolov8")
+    p.add_argument("--yolo-imgsz", type=int, default=640, help="YOLOv8 inference image size")
+    p.add_argument("--yolo-iou", type=float, default=0.45, help="YOLOv8 NMS IoU threshold")
+    p.add_argument(
+        "--yolo-classes",
+        default=None,
+        help="Optional YOLO class filter (comma-separated ids/names), e.g. '0' or 'glasses'.",
+    )
 
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--dataset", help="Dataset folder (expects COCO JSON like annotations/val.json)")
@@ -387,8 +407,10 @@ def main() -> None:
 
     config_raw = None
 
-    # Defaults from config, if provided.
-    if args.config:
+    detector_name = str(args.detector).lower().strip()
+
+    # Defaults from config (TinyFace only), if provided.
+    if detector_name == "tinyface" and args.config:
         config_raw = Config.from_yaml(args.config).raw
         model_cfg = (config_raw or {}).get("model", {}) or {}
         data_cfg = (config_raw or {}).get("data", {}) or {}
@@ -408,22 +430,48 @@ def main() -> None:
         if "input_size" in data_cfg and isinstance(data_cfg["input_size"], (list, tuple)) and len(data_cfg["input_size"]) >= 1:
             args.input_size = int(data_cfg["input_size"][0])
 
-    model = _load_tinyface_model(
-        checkpoint_path=str(args.checkpoint),
-        device=device,
-        backbone=str(args.backbone),
-        width_mult=float(args.width_mult),
-        embed_dim=int(args.embed_dim),
-        dropout=float(args.dropout),
-        deep_head=bool(args.deep_head),
-        pretrained=not bool(args.no_pretrained),
-        strict=bool(args.strict),
-        ema_mode=str(args.ema),
-        config_raw=config_raw,
-    )
+    if detector_name == "tinyface":
+        if not args.checkpoint:
+            raise SystemExit("--checkpoint is required for --detector tinyface")
 
-    print(f"Loaded TinyFaceDetector: backbone={args.backbone}, embed_dim={args.embed_dim}, "
-          f"deep_head={args.deep_head}, input_size={args.input_size}")
+        model = _load_tinyface_model(
+            checkpoint_path=str(args.checkpoint),
+            device=device,
+            backbone=str(args.backbone),
+            width_mult=float(args.width_mult),
+            embed_dim=int(args.embed_dim),
+            dropout=float(args.dropout),
+            deep_head=bool(args.deep_head),
+            pretrained=not bool(args.no_pretrained),
+            strict=bool(args.strict),
+            ema_mode=str(args.ema),
+            config_raw=config_raw,
+        )
+
+        print(
+            f"Loaded TinyFaceDetector: backbone={args.backbone}, embed_dim={args.embed_dim}, "
+            f"deep_head={args.deep_head}, input_size={args.input_size}"
+        )
+    else:
+        if YOLOv8Detector is None:
+            raise SystemExit("Ultralytics is not installed; run: pip install ultralytics")
+        if not args.yolo_weights:
+            raise SystemExit("--yolo-weights is required for --detector yolov8")
+
+        yolo_classes = None
+        if args.yolo_classes:
+            yolo_classes = [c.strip() for c in str(args.yolo_classes).split(",") if c.strip()]
+
+        model = YOLOv8Detector(
+            weights_path=str(args.yolo_weights),
+            device=str(args.device),
+            imgsz=int(args.yolo_imgsz),
+            conf=float(args.conf_th),
+            iou=float(args.yolo_iou),
+            classes=yolo_classes,
+        )
+
+        print(f"Loaded YOLOv8Detector: weights={args.yolo_weights}, imgsz={args.yolo_imgsz}")
 
     _safe_mkdir(args.out_dir)
     viz_dir = str(Path(args.out_dir) / "viz")
@@ -472,29 +520,39 @@ def main() -> None:
             continue
 
         H0, W0 = img_bgr.shape[:2]
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        x_t = _preprocess_rgb_to_tensor(rgb, (input_size, input_size), imagenet_norm=imagenet_norm)
-
-        with torch.no_grad():
-            out = model.predict(x_t.to(device), conf_th=float(args.conf_th))
-
-        # model.predict returns per-image list with bbox in resized-tensor coords
-        info = out[0]
-        conf = float(info.get("conf", 0.0))
-        bbox_resized = info.get("bbox")
 
         pred_bbox_xywh = None
-        if bbox_resized is not None:
-            x1r, y1r, x2r, y2r = [float(v) for v in bbox_resized]
-            # Map back from resized square to original image
-            sx = float(W0) / float(input_size)
-            sy = float(H0) / float(input_size)
-            x1 = x1r * sx
-            y1 = y1r * sy
-            x2 = x2r * sx
-            y2 = y2r * sy
-            x1, y1, x2, y2 = _clip_xyxy(x1, y1, x2, y2, W=W0, H=H0)
-            pred_bbox_xywh = _xyxy_to_xywh(x1, y1, x2, y2)
+        conf = 0.0
+
+        if detector_name == "tinyface":
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            x_t = _preprocess_rgb_to_tensor(rgb, (input_size, input_size), imagenet_norm=imagenet_norm)
+
+            with torch.no_grad():
+                out = model.predict(x_t.to(device), conf_th=float(args.conf_th))
+
+            # model.predict returns per-image list with bbox in resized-tensor coords
+            info = out[0]
+            conf = float(info.get("conf", 0.0))
+            bbox_resized = info.get("bbox")
+
+            if bbox_resized is not None:
+                x1r, y1r, x2r, y2r = [float(v) for v in bbox_resized]
+                # Map back from resized square to original image
+                sx = float(W0) / float(input_size)
+                sy = float(H0) / float(input_size)
+                x1 = x1r * sx
+                y1 = y1r * sy
+                x2 = x2r * sx
+                y2 = y2r * sy
+                x1, y1, x2, y2 = _clip_xyxy(x1, y1, x2, y2, W=W0, H=H0)
+                pred_bbox_xywh = _xyxy_to_xywh(x1, y1, x2, y2)
+        else:
+            dets = model.detect_with_class(img_bgr)
+            if dets:
+                d0 = dets[0]
+                conf = float(d0.score)
+                pred_bbox_xywh = (float(d0.x), float(d0.y), float(d0.w), float(d0.h))
 
         preds.append(
             {

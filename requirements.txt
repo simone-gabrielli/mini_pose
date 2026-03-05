@@ -20,3 +20,7 @@ scikit-image==0.22.0
 # --- UTILS ---
 pyyaml==6.0.1
 tqdm==4.66.3
+
+# --- DETECTION (OPTIONAL) ---
+# Used for YOLOv8 glasses/bbox detection training + inference.
+ultralytics>=8.1,<9

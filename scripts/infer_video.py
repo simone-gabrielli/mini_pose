@@ -67,8 +67,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra margin around detected face box, as a percentage (e.g. 50 -> +50%%).",
     )
 
-    # Detection backend for face boxes.
-    parser.add_argument("--detector", choices=["auto", "yunet", "tinyface"], default="auto")
+    # Detection backend for face/glasses boxes.
+    parser.add_argument("--detector", choices=["auto", "yunet", "tinyface", "yolov8"], default="auto")
     parser.add_argument(
         "--detector-score",
         type=float,
@@ -91,6 +91,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=192,
         help="TinyFace detector square input size (defaults to 192 to match training configs)",
+    )
+
+    parser.add_argument("--yolo-weights", default=None, help="YOLOv8 weights (.pt). Required for --detector yolov8")
+    parser.add_argument("--yolo-imgsz", type=int, default=640, help="YOLOv8 inference image size")
+    parser.add_argument("--yolo-iou", type=float, default=0.45, help="YOLOv8 NMS IoU threshold")
+    parser.add_argument(
+        "--yolo-classes",
+        default=None,
+        help="Optional YOLO class filter (comma-separated ids/names), e.g. '0' or 'glasses'.",
     )
 
     parser.add_argument("--fp16", action="store_true")
@@ -520,6 +529,10 @@ def build_detector(
     yunet_model: str | None = None,
     tinyface_checkpoint: str | None = None,
     tinyface_input: int = 192,
+    yolo_weights: str | None = None,
+    yolo_imgsz: int = 640,
+    yolo_iou: float = 0.45,
+    yolo_classes: str | None = None,
     fp16: bool = False,
     ema_mode: str = "auto",
 ):
@@ -779,6 +792,39 @@ def build_detector(
 
         return TinyFaceWrapper(model, input_size=input_size, conf_th=conf_th)
 
+    def make_yolov8(
+        weights_path: str | None,
+        *,
+        imgsz: int = 640,
+        iou: float = 0.45,
+        conf: float = 0.4,
+        classes: str | None = None,
+    ):
+        if not weights_path:
+            return None
+        try:
+            from pose.detectors.yolov8_detector import YOLOv8Detector
+        except Exception:
+            return None
+
+        cls_list = None
+        if classes:
+            cls_list = [c.strip() for c in str(classes).split(",") if c.strip()]
+
+        try:
+            det = YOLOv8Detector(
+                weights_path=str(weights_path),
+                device=str(device.type if hasattr(device, "type") else device),
+                imgsz=int(imgsz),
+                conf=float(conf),
+                iou=float(iou),
+                classes=cls_list,
+            )
+            return det
+        except Exception as e:
+            print(f"[WARN] Failed to init YOLOv8 detector: {e}")
+            return None
+
     if choice == "yunet":
         model_path = yunet_model or _default_yunet_path() or ""
         det = make_yunet(model_path, score_thresh=float(score_thresh))
@@ -800,7 +846,33 @@ def build_detector(
             raise RuntimeError("TinyFace requested but not available (check pose.detectors.face_detector and dependencies)")
         return det
 
-    # auto: prefer YuNet (if model available) -> TinyFace
+    if choice == "yolov8":
+        det = make_yolov8(
+            yolo_weights,
+            imgsz=int(yolo_imgsz),
+            iou=float(yolo_iou),
+            conf=float(score_thresh),
+            classes=yolo_classes,
+        )
+        if det is None:
+            raise RuntimeError(
+                "YOLOv8 requested but not available. Ensure ultralytics is installed (pip install ultralytics) "
+                "and --yolo-weights points to a valid .pt file."
+            )
+        return det
+
+    # auto: prefer YOLOv8 (if weights provided) -> YuNet (if model available) -> TinyFace
+    if yolo_weights:
+        det = make_yolov8(
+            yolo_weights,
+            imgsz=int(yolo_imgsz),
+            iou=float(yolo_iou),
+            conf=float(score_thresh),
+            classes=yolo_classes,
+        )
+        if det is not None:
+            print("Using YOLOv8 detector")
+            return det
     det = make_yunet((yunet_model or _default_yunet_path() or ""), score_thresh=float(score_thresh))
     if det is not None:
         print("Using YuNet detector")
@@ -816,7 +888,8 @@ def build_detector(
         print("Using TinyFace detector")
         return det
     raise RuntimeError(
-        "No detector available. For YuNet: install opencv-contrib-python and provide --yunet-model. "
+        "No detector available. For YOLOv8: install ultralytics and provide --yolo-weights. "
+        "For YuNet: install opencv-contrib-python and provide --yunet-model. "
         "For TinyFace: ensure pose.detectors.face_detector dependencies are installed."
     )
 
@@ -917,6 +990,10 @@ def main():
         yunet_model=args.yunet_model,
         tinyface_checkpoint=args.tinyface_checkpoint,
         tinyface_input=args.tinyface_input,
+        yolo_weights=args.yolo_weights,
+        yolo_imgsz=args.yolo_imgsz,
+        yolo_iou=args.yolo_iou,
+        yolo_classes=args.yolo_classes,
         fp16=bool(args.fp16),
         ema_mode=str(args.ema),
     )
