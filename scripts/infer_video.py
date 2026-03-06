@@ -1,156 +1,83 @@
-"""Run landmark inference on a video and save annotated video.
+"""Run face detection + landmark inference on a video and save an annotated video.
 
-Features:
-- Face detection backends: OpenCV YuNet, TinyFace (single-face)
-- Batch face crops per frame for faster GPU throughput
-- Mixed precision with `--fp16` on CUDA
-- Graceful shutdown: Ctrl+C saves the output before exiting
+This script intentionally keeps the CLI small. Most settings are inferred from
+the provided YAML configs.
 
-Examples:
-python scripts/infer_video.py --checkpoint work_dirs/xreal_lotr_light/best.pth --input-video input.mp4 --fp16
+Required:
+    --detector-config   YAML config for face detector
+    --detector-chkpt    detector checkpoint (.pth)
+    --landmarks-config  YAML config for landmark model
+    --landmarks-chkpt   landmarks checkpoint (.pth)
+    --input-video       input video path
+
+Example:
+python scripts/infer_video.py \
+    --detector-config configs/face_efficientnet.yaml --detector-chkpt work_dirs/face_efficientnet/best.pth \
+    --landmarks-config configs/xreal_lotr_light.yaml --landmarks-chkpt work_dirs/xreal_lotr_light/best.pth \
+    --input-video input.mp4
 """
 import argparse
 import math
 import os
 import time
 import signal
-from time import perf_counter
 from typing import Tuple
 import xml.etree.ElementTree as ET
 
-import cv2
+try:
+    import cv2  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    cv2 = None
 import torch
 import numpy as np
 
-from pose.engine.inference import load_model as load_heatmap_model, decode_heatmaps
+from pose.engine.inference import decode_heatmaps
 from pose.config import Config
 from pose.registry import MODEL_REGISTRY
 
 # Ensure model modules are imported so they register themselves in MODEL_REGISTRY
 import pose.models  # noqa: F401
+import pose.detectors  # noqa: F401
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
+
+    # Required
+    parser.add_argument("--detector-chkpt", required=True, help="Face detector checkpoint (.pth)")
+    parser.add_argument("--detector-config", required=True, help="Face detector YAML config")
+    parser.add_argument("--landmarks-chkpt", required=True, help="Landmarks checkpoint (.pth)")
+    parser.add_argument("--landmarks-config", required=True, help="Landmarks YAML config")
     parser.add_argument("--input-video", required=True)
+
+    # Optional
     parser.add_argument("--output-video", default=None)
-    parser.add_argument("--model-name", default="lotr_light")
-    parser.add_argument("--num-keypoints", type=int, default=68)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--input-size", type=int, default=256)
     parser.add_argument(
-        "--config",
-        default="",
-        help="Optional YAML config (recommended for LOTR). If set, preprocessing size defaults to cfg.data.input_size.",
-    )
-    parser.add_argument(
-        "--override-input-size",
-        action="store_true",
-        help="In --config mode, force using --input-size instead of cfg.data.input_size for preprocessing.",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Use strict checkpoint loading (only applies when --config is set).",
-    )
-    parser.add_argument(
-        "--ema",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help="EMA weights usage when checkpoint contains EMA state (auto follows config train.ema.eval).",
-    )
-    parser.add_argument(
-        "--face-margin",
+        "--detector-margin",
         type=float,
-        default=50.0,
-        help="Extra margin around detected face box, as a percentage (e.g. 50 -> +50%%).",
-    )
-
-    # Detection backend for face boxes.
-    parser.add_argument("--detector", choices=["auto", "yunet", "tinyface"], default="auto")
-    parser.add_argument(
-        "--detector-score",
-        type=float,
-        default=0.4,
-        help="Score threshold for detectors that output a score/confidence.",
-    )
-    parser.add_argument(
-        "--yunet-model",
         default=None,
-        help="Path to YuNet ONNX model (used when --detector is yunet/auto).",
+        help="Extra margin around detected face box for the landmark crop. Fraction (0.5 = +50%%). Default: inferred from landmarks config.",
     )
-
-    parser.add_argument(
-        "--tinyface-checkpoint",
-        default=None,
-        help="Path to TinyFace detector checkpoint (.pth). If omitted, uses ImageNet-pretrained backbone weights.",
-    )
-    parser.add_argument(
-        "--tinyface-input",
-        type=int,
-        default=192,
-        help="TinyFace detector square input size (defaults to 192 to match training configs)",
-    )
-
-    parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--max-faces", type=int, default=4)
-    parser.add_argument("--skip-frames", type=int, default=1)
     parser.add_argument("--draw-face-box", action="store_true")
-    parser.add_argument("--draw-crop-box", action="store_true", help="Draw the square crop box actually used for inference")
-    parser.add_argument(
-        "--draw-detected-landmarks",
-        dest="draw_detected_landmarks",
-        action="store_true",
-        help="Draw detected/predicted 2D landmarks",
-    )
-    parser.set_defaults(draw_detected_landmarks=False)
-    # Default to 0 because training bbox-crop doesn't add arbitrary padding.
-    parser.add_argument("--box-pad", type=int, default=0, help="Pixel padding added around detected face box")
-    parser.add_argument("--display", action="store_true", help="Show real-time preview window")
-    parser.add_argument(
-        "--show-input-crops",
-        action="store_true",
-        help="Show a debug window with the per-face 256x256 model inputs and landmarks overlaid",
-    )
-    parser.add_argument("--debug-crops-cols", type=int, default=4, help="Columns for the debug crops tiling window")
-    parser.add_argument("--model-3d-xml", default=None, help="Optional 3D landmark template XML; enables PnP + projection overlay")
-    parser.add_argument("--draw-pnp", action="store_true", help="Draw reprojected 3D landmarks (from solvePnP) over the frame")
+    parser.add_argument("--draw-crop-box", action="store_true")
+    parser.add_argument("--draw-landmarks", action="store_true")
     parser.add_argument("--draw-axes", action="store_true", help="Draw pose axes (requires --model-3d-xml)")
-    parser.add_argument("--axes-len", type=float, default=0.05, help="Axes length in 3D units (same units as XML)")
+
+    # True by default; use --no-display to disable.
+    try:
+        parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True)
+    except Exception:
+        parser.add_argument("--display", action="store_true", default=True)
+
+    parser.add_argument("--model-3d-xml", default=None)
+    parser.add_argument("--pnp-max-repr-err", type=float, default=8.0)
     parser.add_argument("--pnp-method", choices=["iterative", "epnp", "p3p", "ap3p"], default="iterative")
-    parser.add_argument(
-        "--pnp-max-reproj-err",
-        type=float,
-        default=8.0,
-        help="Discard PnP result if mean reprojection error (pixels) is above this threshold",
-    )
-    parser.add_argument("--cam-fx", type=float, default=None, help="Camera fx in pixels (default: derived)")
-    parser.add_argument("--cam-fy", type=float, default=None, help="Camera fy in pixels (default: derived)")
-    parser.add_argument("--cam-cx", type=float, default=None, help="Camera cx in pixels (default: W/2)")
-    parser.add_argument("--cam-cy", type=float, default=None, help="Camera cy in pixels (default: H/2)")
-    parser.add_argument("--cam-fov-deg", type=float, default=None, help="Optional horizontal FOV in degrees (used to estimate fx/fy)")
-    parser.add_argument("--display-scale", type=float, default=0.5, help="Scale preview window (e.g. 0.5)")
-    parser.add_argument(
-        "--detect-every",
-        type=int,
-        default=1,
-        help="Run face detector every N processed frames; reuse last boxes in-between",
-    )
-    parser.add_argument(
-        "--detector-scale",
-        type=float,
-        default=1.0,
-        help="Downscale factor for face detection only (e.g. 0.5). Boxes are scaled back.",
-    )
-    parser.add_argument(
-        "--infer-every",
-        type=int,
-        default=1,
-        help="Run keypoint model every N processed frames; reuse last keypoints in-between",
-    )
-    parser.add_argument("--profile", action="store_true", help="Log per-stage timing breakdown")
-    parser.add_argument("--profile-every", type=int, default=60, help="Print timing every N processed frames")
+    parser.add_argument("--cam_fx", type=float, default=None)
+    parser.add_argument("--cam_fy", type=float, default=None)
+    parser.add_argument("--cam_cx", type=float, default=None)
+    parser.add_argument("--cam_cy", type=float, default=None)
+    parser.add_argument("--detect-every", type=int, default=1)
     return parser
 
 
@@ -200,20 +127,13 @@ def _load_3d_landmarks_xml(xml_path: str) -> np.ndarray:
 def _camera_matrix_from_args(W: int, H: int, args) -> np.ndarray:
     """Build an OpenCV pinhole camera matrix K from CLI args.
 
-    If fx/fy aren't provided, use a simple heuristic (max(W,H)). Optionally
-    derive focal length from a horizontal FOV.
+    If fx/fy aren't provided, use a simple heuristic (max(W,H)).
     """
     cx = float(args.cam_cx) if args.cam_cx is not None else (W / 2.0)
     cy = float(args.cam_cy) if args.cam_cy is not None else (H / 2.0)
 
     fx = args.cam_fx
     fy = args.cam_fy
-    if args.cam_fov_deg is not None and (fx is None or fy is None):
-        fov = float(args.cam_fov_deg)
-        # assume horizontal FOV
-        fx_est = (W / 2.0) / max(1e-9, math.tan(math.radians(fov) / 2.0))
-        fx = fx if fx is not None else fx_est
-        fy = fy if fy is not None else fx_est
 
     if fx is None:
         fx = float(max(W, H))
@@ -512,318 +432,112 @@ def _try_extract_norm_coords_batch(model_out: object) -> torch.Tensor | None:
     return coords_norm[..., :2]
 
 
-def build_detector(
-    choice: str,
-    device,
-    *,
-    score_thresh: float = 0.4,
-    yunet_model: str | None = None,
-    tinyface_checkpoint: str | None = None,
-    tinyface_input: int = 192,
-    fp16: bool = False,
-    ema_mode: str = "auto",
-):
-    def _default_yunet_path() -> str | None:
-        # shipped in this repo under scripts/video_test/yunet_detector/
+def _get_cfg_input_size(cfg_raw: dict, *, fallback: Tuple[int, int]) -> Tuple[int, int]:
+    data_cfg = (cfg_raw or {}).get("data", {})
+    if isinstance(data_cfg, dict) and "input_size" in data_cfg and len(data_cfg["input_size"]) == 2:
         try:
-            base = os.path.dirname(os.path.abspath(__file__))
-            p = os.path.join(base, "video_test", "yunet_detector", "face_detection_yunet_2023mar.onnx")
-            return p if os.path.exists(p) else None
+            return (int(data_cfg["input_size"][0]), int(data_cfg["input_size"][1]))
         except Exception:
-            return None
+            return fallback
+    return fallback
 
-    # OpenCV YuNet (FaceDetectorYN)
-    def make_yunet(model_path: str, score_thresh: float = 0.4):
-        if not model_path or not os.path.exists(model_path):
-            return None
 
-        creator = None
-        # OpenCV exposes either FaceDetectorYN.create or FaceDetectorYN_create depending on version/build.
-        if hasattr(cv2, "FaceDetectorYN") and hasattr(cv2.FaceDetectorYN, "create"):
-            creator = cv2.FaceDetectorYN.create
-        elif hasattr(cv2, "FaceDetectorYN_create"):
-            creator = cv2.FaceDetectorYN_create
+def _infer_default_margin_from_landmarks_cfg(cfg_raw: dict) -> float:
+    try:
+        data_cfg = (cfg_raw or {}).get("data", {}) or {}
+        aug = (data_cfg.get("aug", {}) if isinstance(data_cfg, dict) else {}) or {}
+        m = aug.get("face_margin")
+        if m is None:
+            return 0.5
+        return float(m)
+    except Exception:
+        return 0.5
 
-        if creator is None:
-            return None
 
-        try:
-            # config is unused for YuNet ONNX
-            try:
-                det = creator(model_path, "", (320, 320), float(score_thresh), 0.3, 5000)
-            except TypeError:
-                det = creator(model_path, "", (320, 320), float(score_thresh))
+def load_detector_from_config(*, config_path: str, checkpoint_path: str, device: torch.device):
+    """Load detector model from config+checkpoint.
 
-            class YuNetDetector:
-                def __init__(self, det):
-                    self.det = det
+    Expected detector model type: registered as cfg.model.name and implements
+    a `.predict(x, conf_th=...)` method returning a list of dicts with
+    {'conf': float, 'bbox': [x1,y1,x2,y2]} in input-image pixel space.
 
-                def detect(self, img_bgr):
-                    h, w = img_bgr.shape[:2]
-                    # must match current image size
-                    try:
-                        self.det.setInputSize((int(w), int(h)))
-                    except Exception:
-                        # some builds require recreate; if setInputSize missing, fallback to no-op
-                        pass
+    Returns: (detector_wrapper, cfg_raw, input_size)
+    """
 
-                    ok, faces = self.det.detect(img_bgr)
-                    if faces is None or len(faces) == 0:
-                        return []
-                    out = []
-                    for f in faces:
-                        # YuNet output: [x, y, w, h, score, ...]
-                        x, y, bw, bh = f[:4]
-                        score = float(f[4]) if len(f) > 4 else 1.0
-                        if score < float(score_thresh):
-                            continue
-                        out.append((int(x), int(y), int(bw), int(bh), float(score)))
-                    return out
-
-            return YuNetDetector(det)
-        except Exception:
-            return None
-
-    # TinyFace single-box regressor
-    def make_tinyface(
-        checkpoint_path: str | None,
-        *,
-        input_size: int = 256,
-        conf_th: float = 0.4,
-        fp16: bool = False,
-        ema_mode: str = "auto",
-    ):
-        try:
-            from pose.detectors.face_detector import TinyFaceDetector
-        except Exception:
-            return None
-
-        def _get_state_dict(ckpt_obj: object) -> dict:
-            if isinstance(ckpt_obj, dict):
-                for k in ("model", "model_state", "state_dict", "weights"):
-                    sd = ckpt_obj.get(k)
-                    if isinstance(sd, dict):
-                        return sd
-                # maybe the dict itself is already a state_dict
-                if ckpt_obj and all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
-                    return ckpt_obj
-            if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
-                return ckpt_obj["model"]
-            raise ValueError("Unsupported checkpoint format")
-
-        def _strip_module_prefix(sd: dict) -> dict:
-            out = {}
-            for k, v in sd.items():
-                nk = k
-                if nk.startswith("module."):
-                    nk = nk[len("module.") :]
-                out[nk] = v
-            return out
-
-        # Instantiate with a matching backbone/head. We infer these from the
-        # checkpoint (when provided) so we don't need a long list of CLI args.
-        inferred_backbone = "mobilenet_v2"
-        inferred_embed_dim: int | None = None
-        inferred_deep_head: bool | None = None
-        sd = None
-        ema_shadow = None
-        if checkpoint_path:
-            try:
-                ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                ckpt = torch.load(checkpoint_path, map_location="cpu")
-            sd = _strip_module_prefix(_get_state_dict(ckpt))
-
-            # Many checkpoints are trained/evaluated with EMA. The 'best.pth'
-            # is usually selected using EMA weights, while ckpt['model'] holds
-            # the raw (non-EMA) weights. Use EMA shadow when available.
-            if isinstance(ckpt, dict):
-                ema = ckpt.get("ema")
-                if isinstance(ema, dict):
-                    shadow = ema.get("shadow")
-                    if isinstance(shadow, dict) and shadow:
-                        ema_shadow = _strip_module_prefix(shadow)
-
-            try:
-                import re
-
-                keys = list(sd.keys())
-
-                # Infer head type: deep_head checkpoints have fc.9.* (final Linear at index 9).
-                inferred_deep_head = any(k.startswith("fc.9.") for k in keys) or any(k.startswith("fc.6.") for k in keys)
-
-                # Infer embed dim from the first Linear in the head.
-                fc1 = sd.get("fc.1.weight")
-                if isinstance(fc1, torch.Tensor) and fc1.dim() == 2:
-                    inferred_embed_dim = int(fc1.shape[0])
-
-                # Infer backbone from feature key structure.
-                # - EfficientNet-B0 (torchvision) has nested blocks: features.<stage>.<block>.block.*
-                # - MobileNetV3 has: features.<idx>.block.*
-                # - MobileNetV2 has: features.<idx>.conv.*
-                if any(re.match(r"^features\.\d+\.\d+\.block\.", k) for k in keys):
-                    inferred_backbone = "efficientnet_b0"
-                elif any(re.match(r"^features\.\d+\.block\.", k) for k in keys):
-                    inferred_backbone = "mobilenet_v3_small"
-                else:
-                    inferred_backbone = "mobilenet_v2"
-            except Exception:
-                pass
-
-        model_kwargs = {
-            "pretrained": bool(not checkpoint_path),
-            "backbone": str(inferred_backbone),
-        }
-        if inferred_embed_dim is not None:
-            model_kwargs["embed_dim"] = int(inferred_embed_dim)
-        if inferred_deep_head is not None:
-            model_kwargs["deep_head"] = bool(inferred_deep_head)
-
-        model = TinyFaceDetector(**model_kwargs)
-
-        if checkpoint_path and sd is not None:
-            try:
-                model.load_state_dict(sd, strict=True)
-            except RuntimeError as e:
-                raise RuntimeError(
-                    "TinyFace checkpoint is not compatible with the TinyFaceDetector architecture. "
-                    f"Inferred backbone='{inferred_backbone}'. "
-                    "If this checkpoint is from a different model, use a proper TinyFace detector checkpoint "
-                    "or switch to '--detector yunet'.\n\nOriginal error:\n" + str(e)
-                )
-
-        model.to(device)
-        model.eval()
-
-        if fp16 and device.type == "cuda":
-            try:
-                model = model.half()
-            except Exception:
-                pass
-
-        # Optionally apply EMA shadow weights.
-        try:
-            use_ema = str(ema_mode).lower().strip() in {"auto", "on", "true", "1", "yes"}
-        except Exception:
-            use_ema = True
-
-        if use_ema and isinstance(ema_shadow, dict) and ema_shadow:
-            applied = 0
-            for name, p in model.named_parameters():
-                if name not in ema_shadow:
-                    continue
-                t = ema_shadow.get(name)
-                if not isinstance(t, torch.Tensor):
-                    continue
-                if not torch.is_floating_point(p.data):
-                    continue
-                if t.device != p.device:
-                    t = t.to(device=p.device)
-                if t.dtype != p.dtype:
-                    t = t.to(dtype=p.dtype)
-                try:
-                    p.data.copy_(t)
-                    applied += 1
-                except Exception:
-                    continue
-            if applied > 0:
-                print(f"Using TinyFace EMA weights (applied {applied} params)")
-
-        class TinyFaceWrapper:
-            def __init__(self, model, input_size: int, conf_th: float):
-                self.model = model
-                self.input_size = int(input_size)
-                self.conf_th = float(conf_th)
-
-            def detect(self, img_bgr):
-                H0, W0 = img_bgr.shape[:2]
-                if H0 <= 0 or W0 <= 0:
-                    return []
-
-                # Match the TinyFace training pipeline (AlbumentationsKeypointPipeline):
-                # resize to input_size and ImageNet mean/std normalization.
-                rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                s = max(32, int(self.input_size))
-                x_t = _preprocess_rgb_to_tensor(rgb, input_size=(s, s)).unsqueeze(0)
-                if fp16 and device.type == "cuda":
-                    x_t = x_t.half()
-                else:
-                    x_t = x_t.float()
-
-                with torch.inference_mode():
-                    res = self.model.predict(x_t, conf_th=self.conf_th)
-
-                if not res or res[0].get("bbox") is None:
-                    return []
-
-                conf = float(res[0].get("conf", 1.0))
-                x1, y1, x2, y2 = res[0]["bbox"]
-
-                # Map from square resized coords back to original frame coords.
-                sx = float(W0) / float(s)
-                sy = float(H0) / float(s)
-                x1 = int(round(float(x1) * sx))
-                y1 = int(round(float(y1) * sy))
-                x2 = int(round(float(x2) * sx))
-                y2 = int(round(float(y2) * sy))
-
-                # clamp
-                x1 = max(0, min(W0 - 1, x1))
-                y1 = max(0, min(H0 - 1, y1))
-                x2 = max(0, min(W0 - 1, x2))
-                y2 = max(0, min(H0 - 1, y2))
-
-                if x2 <= x1 or y2 <= y1:
-                    return []
-                return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(conf))]
-
-        return TinyFaceWrapper(model, input_size=input_size, conf_th=conf_th)
-
-    if choice == "yunet":
-        model_path = yunet_model or _default_yunet_path() or ""
-        det = make_yunet(model_path, score_thresh=float(score_thresh))
-        if det is None:
-            raise RuntimeError(
-                "YuNet requested but not available. Ensure: (1) opencv-contrib-python installed, "
-                "(2) your OpenCV build exposes FaceDetectorYN, (3) --yunet-model points to a valid .onnx file."
-            )
-        return det
-    if choice == "tinyface":
-        det = make_tinyface(
-            tinyface_checkpoint,
-            input_size=tinyface_input,
-            conf_th=float(score_thresh),
-            fp16=fp16,
-            ema_mode=str(ema_mode),
-        )
-        if det is None:
-            raise RuntimeError("TinyFace requested but not available (check pose.detectors.face_detector and dependencies)")
-        return det
-
-    # auto: prefer YuNet (if model available) -> TinyFace
-    det = make_yunet((yunet_model or _default_yunet_path() or ""), score_thresh=float(score_thresh))
-    if det is not None:
-        print("Using YuNet detector")
-        return det
-    det = make_tinyface(
-        tinyface_checkpoint,
-        input_size=tinyface_input,
-        conf_th=float(score_thresh),
-        fp16=fp16,
-        ema_mode=str(ema_mode),
+    det_model, det_cfg, _ = _load_model_from_config(
+        config_path=str(config_path),
+        checkpoint_path=str(checkpoint_path),
+        device=device,
+        fallback_num_keypoints=0,
+        weights_only=True,
+        strict=False,
+        # Use non-EMA weights for detector, matching scripts/infer_bbox.py.
+        # The EMA shadow for bbox models is typically incomplete (missing BN
+        # buffers), so infer_bbox falls back to ckpt['model'].  Using the
+        # partial EMA overlay produces a tighter / shifted box.
+        ema_mode="off",
     )
-    if det is not None:
-        print("Using TinyFace detector")
-        return det
-    raise RuntimeError(
-        "No detector available. For YuNet: install opencv-contrib-python and provide --yunet-model. "
-        "For TinyFace: ensure pose.detectors.face_detector dependencies are installed."
-    )
+
+    det_input_size = _get_cfg_input_size(det_cfg, fallback=(192, 192))
+
+    class DetectorWrapper:
+        def __init__(self, model, input_size: Tuple[int, int]):
+            self.model = model
+            self.input_size = (int(input_size[0]), int(input_size[1]))
+
+        def detect(self, img_bgr: np.ndarray, *, conf_th: float = 0.4):
+            H0, W0 = img_bgr.shape[:2]
+            if H0 <= 0 or W0 <= 0:
+                return []
+
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+            W_in, H_in = int(self.input_size[0]), int(self.input_size[1])
+            # Match scripts/infer_bbox.py behavior: direct resize to model input size.
+            x_t = _preprocess_rgb_to_tensor(rgb, input_size=self.input_size).unsqueeze(0)
+            x_t = x_t.to(device=device)
+
+            with torch.inference_mode():
+                if hasattr(self.model, "predict"):
+                    res = self.model.predict(x_t, conf_th=float(conf_th))
+                else:
+                    raise TypeError(f"Detector model {type(self.model).__name__} has no .predict()")
+
+            if not res or not isinstance(res, list):
+                return []
+            bbox = res[0].get("bbox") if isinstance(res[0], dict) else None
+            if bbox is None:
+                return []
+
+            conf = float(res[0].get("conf", 1.0)) if isinstance(res[0], dict) else 1.0
+            x1, y1, x2, y2 = bbox
+
+            sx = float(W0) / max(1e-9, float(W_in))
+            sy = float(H0) / max(1e-9, float(H_in))
+            x1 = int(round(float(x1) * sx))
+            y1 = int(round(float(y1) * sy))
+            x2 = int(round(float(x2) * sx))
+            y2 = int(round(float(y2) * sy))
+
+            x1 = max(0, min(W0 - 1, x1))
+            y1 = max(0, min(H0 - 1, y1))
+            x2 = max(0, min(W0 - 1, x2))
+            y2 = max(0, min(H0 - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                return []
+            return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(conf))]
+
+    return DetectorWrapper(det_model, det_input_size), det_cfg, det_input_size
 
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if cv2 is None:
+        raise ModuleNotFoundError(
+            "OpenCV (cv2) is required for video I/O. Install e.g. 'opencv-python' or 'opencv-contrib-python'."
+        )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -840,42 +554,22 @@ def main():
         except Exception:
             pass
 
-    weights_only = True
-    cfg = None
-    if args.config:
-        model, cfg, cfg_num_keypoints = _load_model_from_config(
-            config_path=str(args.config),
-            checkpoint_path=str(args.checkpoint),
-            device=device,
-            fallback_num_keypoints=int(args.num_keypoints),
-            weights_only=weights_only,
-            strict=bool(args.strict),
-            ema_mode=str(args.ema),
-        )
-        args.num_keypoints = int(cfg_num_keypoints)
-    else:
-        model = load_heatmap_model(args.checkpoint, model_name=args.model_name, num_keypoints=args.num_keypoints, device=device)
-
-    # Choose preprocessing input size (W,H). In config mode, prefer cfg.data.input_size
-    # unless user forces --override-input-size.
-    if args.config and cfg is not None and not args.override_input_size:
-        data_cfg = (cfg or {}).get("data", {})
-        if isinstance(data_cfg, dict) and "input_size" in data_cfg and len(data_cfg["input_size"]) == 2:
-            preprocess_size = (int(data_cfg["input_size"][0]), int(data_cfg["input_size"][1]))
-        else:
-            preprocess_size = (int(args.input_size), int(args.input_size))
-    else:
-        preprocess_size = (int(args.input_size), int(args.input_size))
+    # Landmarks model is always loaded from config.
+    model, lm_cfg, _ = _load_model_from_config(
+        config_path=str(args.landmarks_config),
+        checkpoint_path=str(args.landmarks_chkpt),
+        device=device,
+        fallback_num_keypoints=68,
+        weights_only=True,
+        strict=False,
+        ema_mode="auto",
+    )
+    preprocess_size = _get_cfg_input_size(lm_cfg, fallback=(256, 256))
 
     if int(preprocess_size[0]) < 32 or int(preprocess_size[1]) < 32:
         print(f"[WARN] Very small preprocessing size {preprocess_size}. Did you mean e.g. 192 or 256?")
 
-    try:
-        print(f"Loaded model: {type(model).__name__} | preprocess_size={preprocess_size}")
-        if hasattr(model, "input_size"):
-            print(f"Model input_size attribute: {getattr(model, 'input_size')}")
-    except Exception:
-        pass
+    print(f"Loaded landmarks model: {type(model).__name__} | preprocess_size={preprocess_size}")
     try:
         p0 = next(model.parameters())
         print(f"Model parameter device: {p0.device}")
@@ -907,58 +601,35 @@ def main():
     K_cam = _camera_matrix_from_args(W, H, args)
     dist = np.zeros((4, 1), dtype=np.float64)
 
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
 
-    detector = build_detector(
-        args.detector if args.detector != "auto" else "auto",
-        device,
-        score_thresh=float(args.detector_score),
-        yunet_model=args.yunet_model,
-        tinyface_checkpoint=args.tinyface_checkpoint,
-        tinyface_input=args.tinyface_input,
-        fp16=bool(args.fp16),
-        ema_mode=str(args.ema),
+    detector, det_cfg, det_input_size = load_detector_from_config(
+        config_path=str(args.detector_config),
+        checkpoint_path=str(args.detector_chkpt),
+        device=device,
     )
+    print(f"Loaded detector model from {args.detector_config} | input_size={det_input_size}")
 
-    frame_idx = 0
+    if args.detector_margin is None:
+        margin_default = _infer_default_margin_from_landmarks_cfg(lm_cfg)
+        margin_arg = float(margin_default)
+    else:
+        margin_arg = float(args.detector_margin)
+
+    # Backward-compat convenience: treat large values as percent.
+    margin_frac = (margin_arg / 100.0) if margin_arg > 1.5 else margin_arg
+
     t_start = time.time()
     processed = 0
 
-    # ---- Per-stream caches (avoid redundant work when detect/infer cadence > 1) ----
-    # last_boxes: list of detector boxes in full-frame pixel space.
-    # Each box is either (x, y, w, h) or (x, y, w, h, score).
-    last_boxes = []
-    last_detect_frame = -10**9  # counter in "processed" frames
-
-    # last_kpts: list of (K,2) landmarks in full-frame pixel space.
-    last_kpts = []
-    last_kpts_frame = -10**9
-
-    # last_pnp: list aligned with last_kpts, each item contains rvec/tvec/proj/err.
-    last_pnp = []
-    last_pnp_frame = -10**9
-
-    # Debug visualization cache for the tiled crop window.
-    last_debug_tile = None
-
-    # profiling accumulators (seconds)
-    prof = {
-        "read": 0.0,
-        "detect": 0.0,
-        "preprocess": 0.0,
-        "to_device": 0.0,
-        "forward": 0.0,
-        "to_cpu": 0.0,
-        "decode_draw": 0.0,
-        "write": 0.0,
-        "display": 0.0,
-        "total": 0.0,
-    }
-    prof_n = 0
+    # Cache the last detector box so --detect-every can skip detector work.
+    last_box = None
+    last_detect_frame = -10**9
 
     window_name = "mini_pose"
-    paused = False
 
     stop_requested = {"stop": False}
 
@@ -973,345 +644,117 @@ def main():
 
     try:
         while True:
-            t_total0 = perf_counter() if args.profile else None
-
-            # ---- 1) Read next frame ----
-            t0 = perf_counter() if args.profile else None
             ret, frame_bgr = cap.read()
-            if args.profile:
-                prof["read"] += perf_counter() - t0
-
             if not ret:
                 break
 
             if stop_requested["stop"]:
                 break
 
-            if (frame_idx % args.skip_frames) != 0:
-                # Skip this frame entirely (write original frame, optionally preview).
-                t0 = perf_counter() if args.profile else None
-                writer.write(frame_bgr)
-                if args.profile:
-                    prof["write"] += perf_counter() - t0
-
-                if args.display:
-                    t0 = perf_counter() if args.profile else None
-                    disp = frame_bgr
-                    if args.display_scale and args.display_scale != 1.0:
-                        disp = cv2.resize(
-                            disp,
-                            (int(W * args.display_scale), int(H * args.display_scale)),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    cv2.imshow(window_name, disp)
-                    key = cv2.waitKey(1 if not paused else 30) & 0xFF
-                    if key in (ord("q"), 27):
-                        stop_requested["stop"] = True
-                    elif key == ord("p"):
-                        paused = not paused
-                    if args.profile:
-                        prof["display"] += perf_counter() - t0
-
-                frame_idx += 1
-                continue
-
-            # ---- 2) Face detection (optionally cached) ----
-            t0 = perf_counter() if args.profile else None
-            do_detect = (processed - last_detect_frame) >= max(1, args.detect_every)
-            boxes = last_boxes
-
+            # ---- 1) Detection (optionally cached) ----
+            do_detect = (processed - last_detect_frame) >= max(1, int(args.detect_every))
             if do_detect:
-                det_frame = frame_bgr
-                scale = float(args.detector_scale)
-                if scale != 1.0 and scale > 0:
-                    det_frame = cv2.resize(
-                        frame_bgr,
-                        (max(1, int(W * scale)), max(1, int(H * scale))),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                boxes = detector.detect(det_frame)
-                if scale != 1.0 and scale > 0 and boxes:
-                    inv = 1.0 / scale
-                    scaled = []
-                    for b in boxes:
-                        if b is None or len(b) < 4:
-                            continue
-                        x, y, w, h = b[0], b[1], b[2], b[3]
-                        if len(b) >= 5:
-                            scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv), float(b[4])))
-                        else:
-                            scaled.append((int(x * inv), int(y * inv), int(w * inv), int(h * inv)))
-                    boxes = scaled
-                last_boxes = boxes
+                dets = detector.detect(frame_bgr, conf_th=0.4)
+                last_box = dets[0] if dets else None
                 last_detect_frame = processed
 
-            if args.profile:
-                prof["detect"] += perf_counter() - t0
+            # ---- 2) Landmark inference (always runs; uses last_box when detector is skipped) ----
+            if last_box is not None:
+                x, y, w, h = int(last_box[0]), int(last_box[1]), int(last_box[2]), int(last_box[3])
 
-            # ---- 3) Landmark inference (optionally cached) ----
-            do_infer = (processed - last_kpts_frame) >= max(1, args.infer_every)
-            if do_detect:
-                # if boxes just changed, ensure we refresh keypoints
-                do_infer = True
+                if args.draw_face_box:
+                    x1 = max(0, x)
+                    y1 = max(0, y)
+                    x2 = min(W - 1, x + w)
+                    y2 = min(H - 1, y + h)
+                    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
-            if boxes and do_infer:
-                t0 = perf_counter() if args.profile else None
-                faces = []
-                boxes_clamped = []
-                face_inputs_bgr = []  # resized (stretched) model inputs, BGR
-                for box in boxes[: args.max_faces]:
-                    if box is None or len(box) < 4:
-                        continue
-                    x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                    # --face-margin is percent (e.g. 50 -> +50%). For backward compat,
-                    # treat values in [0..1.5] as already-a-fraction.
-                    m = float(args.face_margin)
-                    margin = (m / 100.0) if m > 1.5 else m
-                    cx = x + w / 2.0
-                    cy = y + h / 2.0
-                    size = max(w, h) * (1.0 + margin)
-                    pad = int(max(0, args.box_pad))
-                    x1 = int(cx - size / 2.0) - pad
-                    y1 = int(cy - size / 2.0) - pad
-                    x2 = int(cx + size / 2.0) + pad
-                    y2 = int(cy + size / 2.0) + pad
+                # Build square crop around detection, expanded by margin_frac.
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+                size = max(w, h) * (1.0 + float(margin_frac))
+                x1 = int(cx - size / 2.0)
+                y1 = int(cy - size / 2.0)
+                x2 = int(cx + size / 2.0)
+                y2 = int(cy + size / 2.0)
 
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    # x2/y2 are treated as EXCLUSIVE (Python slicing semantics)
-                    x2 = min(W, x2)
-                    y2 = min(H, y2)
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(W, x2)
+                y2 = min(H, y2)
+                face_bgr = frame_bgr[y1:y2, x1:x2]
 
-                    face_bgr = frame_bgr[y1:y2, x1:x2]
-                    if face_bgr.size == 0:
-                        continue
-
+                kpts_frame = None
+                pnp_sol = None
+                if face_bgr.size != 0:
                     if args.draw_crop_box:
                         cv2.rectangle(frame_bgr, (x1, y1), (max(x1, x2 - 1), max(y1, y2 - 1)), (255, 0, 0), 1)
 
                     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
                     img_t = _preprocess_rgb_to_tensor(face_rgb, input_size=preprocess_size)
-                    faces.append(img_t)
-                    boxes_clamped.append((x1, y1, x2, y2))
-
-                    if args.show_input_crops:
-                        face_in = cv2.resize(face_bgr, (int(preprocess_size[0]), int(preprocess_size[1])), interpolation=cv2.INTER_LINEAR)
-                        face_inputs_bgr.append(face_in)
-
-                if args.profile:
-                    prof["preprocess"] += perf_counter() - t0
-
-                if faces:
-                    t0 = perf_counter() if args.profile else None
-                    batch = torch.stack(faces, dim=0).to(device)
-                    if args.profile:
-                        prof["to_device"] += perf_counter() - t0
+                    batch = img_t.unsqueeze(0).to(device)
 
                     with torch.inference_mode():
-                        t0 = perf_counter() if args.profile else None
-                        if args.profile and device.type == "cuda":
-                            torch.cuda.synchronize()
-                        if args.fp16 and device.type == "cuda":
-                            from torch.cuda.amp import autocast
-
-                            with autocast():
-                                preds = model(batch)
-                        else:
-                            preds = model(batch)
-                        if args.profile and device.type == "cuda":
-                            torch.cuda.synchronize()
-                        if args.profile:
-                            prof["forward"] += perf_counter() - t0
+                        preds = model(batch)
 
                     # Decode either coordinate-regression outputs (LOTR) or heatmaps.
-                    t0 = perf_counter() if args.profile else None
                     coords_norm_batch = _try_extract_norm_coords_batch(preds)
-
                     if coords_norm_batch is not None:
-                        # (B, K, 2) in NORMALIZED [0,1] space. Scale by the
-                        # actual preprocessing size to get crop-pixel coords,
-                        # matching how the Trainer computes preds_2d during
-                        # training (landmarks_norm * [W_in, H_in]).
-                        coords_norm_batch = coords_norm_batch.detach().float().cpu().numpy()
-                        if args.profile:
-                            prof["to_cpu"] += perf_counter() - t0
-
-                        t1 = perf_counter() if args.profile else None
-                        kpts_out = []
-                        W_face = float(preprocess_size[0])
-                        H_face = float(preprocess_size[1])
-                        debug_inputs = []
-                        for i in range(coords_norm_batch.shape[0]):
-                            coords = coords_norm_batch[i].copy()
-                            # Normalized -> crop pixel space
-                            coords[:, 0] *= W_face
-                            coords[:, 1] *= H_face
-                            if args.show_input_crops and i < len(face_inputs_bgr):
-                                dbg = face_inputs_bgr[i].copy()
-                                draw_landmarks(dbg, coords, color=(0, 0, 255))
-                                cv2.putText(dbg, f"face {i}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                                debug_inputs.append(dbg)
-                            # Crop pixel space -> full frame pixel space
-                            x1, y1, x2, y2 = boxes_clamped[i]
-                            scale_x = (x2 - x1) / W_face
-                            scale_y = (y2 - y1) / H_face
-                            coords[:, 0] = coords[:, 0] * scale_x + x1
-                            coords[:, 1] = coords[:, 1] * scale_y + y1
-                            kpts_out.append(coords)
-
-                        if args.show_input_crops and debug_inputs:
-                            last_debug_tile = _tile_same_size(debug_inputs, cols=args.debug_crops_cols)
-
-                        last_kpts = kpts_out
-                        last_kpts_frame = processed
-
-                        if obj_pts_3d is not None:
-                            last_pnp = _run_pnp_batch(
-                                obj_pts_3d,
-                                kpts_out,
-                                K_cam,
-                                dist,
-                                method=str(args.pnp_method),
-                                max_reproj_err=float(args.pnp_max_reproj_err),
-                            )
-                            last_pnp_frame = processed
-                        if args.profile:
-                            prof["decode_draw"] += perf_counter() - t1
-
+                        coords_norm = coords_norm_batch[0].detach().float().cpu().numpy().astype(np.float32)
+                        coords = coords_norm.copy()
+                        coords[:, 0] *= float(preprocess_size[0])
+                        coords[:, 1] *= float(preprocess_size[1])
                     else:
-                        # Heatmap-based models
-                        preds_last = _extract_preds_last(preds)
-                        preds_last = preds_last.detach().cpu()
-                        if args.profile:
-                            prof["to_cpu"] += perf_counter() - t0
+                        preds_last = _extract_preds_last(preds)[0].detach().cpu()
+                        coords = decode_heatmaps(preds_last)
+                        H_hm, W_hm = preds_last.shape[1:]
+                        coords[:, 0] *= float(preprocess_size[0]) / float(W_hm)
+                        coords[:, 1] *= float(preprocess_size[1]) / float(H_hm)
 
-                        t1 = perf_counter() if args.profile else None
-                        kpts_out = []
-                        debug_inputs = []
-                        for i in range(preds_last.shape[0]):
-                            heatmaps = preds_last[i]
-                            coords = decode_heatmaps(heatmaps)
+                    # Crop pixel space -> full-frame pixel space.
+                    scale_x = (x2 - x1) / float(preprocess_size[0])
+                    scale_y = (y2 - y1) / float(preprocess_size[1])
+                    coords[:, 0] = coords[:, 0] * scale_x + x1
+                    coords[:, 1] = coords[:, 1] * scale_y + y1
+                    kpts_frame = coords
 
-                            H_hm, W_hm = heatmaps.shape[1:]
-                            W_face = float(preprocess_size[0])
-                            H_face = float(preprocess_size[1])
-                            coords[:, 0] *= (W_face / W_hm)
-                            coords[:, 1] *= (H_face / H_hm)
+                    if obj_pts_3d is not None:
+                        pnp = _run_pnp_batch(
+                            obj_pts_3d,
+                            [kpts_frame],
+                            K_cam,
+                            dist,
+                            method=str(args.pnp_method),
+                            max_reproj_err=float(args.pnp_max_repr_err),
+                        )
+                        if pnp and isinstance(pnp[0], dict):
+                            pnp_sol = pnp[0]
 
-                            if args.show_input_crops and i < len(face_inputs_bgr):
-                                dbg = face_inputs_bgr[i].copy()
-                                draw_landmarks(dbg, coords, color=(0, 0, 255))
-                                cv2.putText(dbg, f"face {i}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                                debug_inputs.append(dbg)
+                if args.draw_landmarks and kpts_frame is not None:
+                    draw_landmarks(frame_bgr, kpts_frame, color=(0, 0, 255))
 
-                            x1, y1, x2, y2 = boxes_clamped[i]
-                            scale_x = (x2 - x1) / float(W_face)
-                            scale_y = (y2 - y1) / float(H_face)
-                            coords[:, 0] = coords[:, 0] * scale_x + x1
-                            coords[:, 1] = coords[:, 1] * scale_y + y1
+                # If 3D template is provided, draw projected points and axes by default.
+                if obj_pts_3d is not None and pnp_sol is not None:
+                    proj = pnp_sol.get("proj")
+                    rvec = pnp_sol.get("rvec")
+                    tvec = pnp_sol.get("tvec")
+                    if proj is not None:
+                        draw_landmarks(frame_bgr, proj, color=(0, 255, 0))
+                    if args.draw_axes and rvec is not None and tvec is not None:
+                        try:
+                            cv2.drawFrameAxes(frame_bgr, K_cam, dist, rvec, tvec, 0.05, 2)
+                        except Exception:
+                            pass
 
-                            kpts_out.append(coords)
-
-                        if args.show_input_crops and debug_inputs:
-                            last_debug_tile = _tile_same_size(debug_inputs, cols=args.debug_crops_cols)
-
-                        last_kpts = kpts_out
-                        last_kpts_frame = processed
-
-                        if obj_pts_3d is not None:
-                            last_pnp = _run_pnp_batch(
-                                obj_pts_3d,
-                                kpts_out,
-                                K_cam,
-                                dist,
-                                method=str(args.pnp_method),
-                                max_reproj_err=float(args.pnp_max_reproj_err),
-                            )
-                            last_pnp_frame = processed
-
-                        if args.profile:
-                            prof["decode_draw"] += perf_counter() - t1
-
-            # ---- 4) Draw overlays ----
-            # We draw the *latest cached* keypoints, which may be from a previous
-            # frame if --infer-every > 1.
-            if boxes:
-                t0 = perf_counter() if args.profile else None
-                for i, box in enumerate(boxes[: args.max_faces]):
-                    if box is None or len(box) < 4:
-                        continue
-                    x, y, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                    if args.draw_face_box:
-                        pad = int(max(0, args.box_pad))
-                        x1 = max(0, int(x) - pad)
-                        y1 = max(0, int(y) - pad)
-                        x2 = min(W - 1, int(x + w) + pad)
-                        y2 = min(H - 1, int(y + h) + pad)
-                        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 1)
-                    if i < len(last_kpts):
-                        if args.draw_detected_landmarks:
-                            draw_landmarks(frame_bgr, last_kpts[i], color=(0, 0, 255))
-
-                        if obj_pts_3d is not None and i < len(last_pnp):
-                            proj = last_pnp[i].get("proj") if isinstance(last_pnp[i], dict) else None
-                            rvec = last_pnp[i].get("rvec") if isinstance(last_pnp[i], dict) else None
-                            tvec = last_pnp[i].get("tvec") if isinstance(last_pnp[i], dict) else None
-
-                            if args.draw_pnp and proj is not None:
-                                draw_landmarks(frame_bgr, proj, color=(0, 255, 0))
-
-                            if args.draw_axes and rvec is not None and tvec is not None:
-                                try:
-                                    cv2.drawFrameAxes(frame_bgr, K_cam, dist, rvec, tvec, float(args.axes_len), 2)
-                                except Exception:
-                                    pass
-                if args.profile:
-                    prof["decode_draw"] += perf_counter() - t0
-
-            t0 = perf_counter() if args.profile else None
             writer.write(frame_bgr)
-            if args.profile:
-                prof["write"] += perf_counter() - t0
 
             if args.display:
-                t0 = perf_counter() if args.profile else None
-                disp = frame_bgr
-                if args.display_scale and args.display_scale != 1.0:
-                    disp = cv2.resize(
-                        disp,
-                        (int(W * args.display_scale), int(H * args.display_scale)),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                cv2.imshow(window_name, disp)
-                if args.show_input_crops and last_debug_tile is not None:
-                    cv2.imshow(f"{window_name}_inputs", last_debug_tile)
-                key = cv2.waitKey(1 if not paused else 30) & 0xFF
+                cv2.imshow(window_name, frame_bgr)
+                key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     stop_requested["stop"] = True
-                elif key == ord("p"):
-                    paused = not paused
-                if args.profile:
-                    prof["display"] += perf_counter() - t0
 
-            frame_idx += 1
             processed += 1
-
-            if args.profile:
-                prof["total"] += perf_counter() - t_total0
-                prof_n += 1
-                if args.profile_every > 0 and (processed % args.profile_every) == 0 and prof_n > 0:
-                    avg = {k: (v / prof_n) * 1000.0 for k, v in prof.items()}
-                    fps_est = 1000.0 / max(1e-6, avg["total"])
-                    det_mode = f"every={args.detect_every}, scale={args.detector_scale}" \
-                        if args.detect_every != 1 or args.detector_scale != 1.0 else "default"
-                    print(
-                        "Timing (ms/frame): "
-                        f"total={avg['total']:.1f}, read={avg['read']:.1f}, detect={avg['detect']:.1f}, "
-                        f"prep={avg['preprocess']:.1f}, to_dev={avg['to_device']:.1f}, "
-                        f"fwd={avg['forward']:.1f}, to_cpu={avg['to_cpu']:.1f}, decode/draw={avg['decode_draw']:.1f}, "
-                        f"write={avg['write']:.1f}, display={avg['display']:.1f} | "
-                        f"~{fps_est:.1f} fps | det({det_mode}) | infer(every={args.infer_every})"
-                    )
 
             if processed % 100 == 0:
                 elapsed = time.time() - t_start
