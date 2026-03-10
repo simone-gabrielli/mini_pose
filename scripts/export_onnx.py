@@ -218,7 +218,7 @@ def main() -> None:
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--weights-only", action="store_true", help="Use torch.load(..., weights_only=True) if supported")
     parser.add_argument("--strict", action="store_true", help="Strict state_dict loading")
-    parser.add_argument("--ema", default="auto", choices=["auto", "on", "off"], help="Use EMA weights if present")
+    parser.add_argument("--ema", default="off", choices=["auto", "on", "off"], help="Use EMA weights if present")
 
     parser.add_argument("--dynamic-batch", action="store_true", help="Export with dynamic batch dimension")
     parser.add_argument(

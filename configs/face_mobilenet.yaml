@@ -3,10 +3,10 @@ seed: 1337
 
 data:
   type: coco_face
-  input_size: [192, 192]
+  input_size: [512, 512]
 
-  batch_size: 32
-  val_batch_size: 32
+  batch_size: 16
+  val_batch_size: 16
   num_workers: 0
 
   train_datasets:
@@ -105,7 +105,7 @@ train:
     enabled: true
     dtype: fp16
   ema:
-    enabled: true
+    enabled: false
     decay: 0.999
     update_every: 1
     eval: true
