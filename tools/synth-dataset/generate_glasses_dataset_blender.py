@@ -66,24 +66,54 @@ import trimesh
 # -------------------------------------------------------------------------
 
 # Mapping: glasses landmark id -> face landmark id
-GLASSES_TO_FACE_IDXS = {
-    19: 26,
-    20: 25,
-    21: 24,
-    22: 23,
-    23: 22,
-    28: 21,
-    29: 20,
-    30: 19,
-    31: 18,
-    32: 17,
-    45: 16,
-    51: 0,
+GLASSES_TO_FACE_IDXS_BY_FACE_KPTS = {
+    68: {
+        19: 26,
+        20: 25,
+        21: 24,
+        22: 23,
+        23: 22,
+        28: 21,
+        29: 20,
+        30: 19,
+        31: 18,
+        32: 17,
+        45: 16,
+        51: 0,
+    },
+    98: {
+        19: 46,
+        20: 47,
+        21: 48,
+        22: 49,
+        23: 50,
+        28: 38,
+        29: 39,
+        30: 40,
+        31: 41,
+        32: 33,
+        45: 32,
+        51: 0,
+    },
 }
+
+GLASSES_TO_FACE_IDXS = dict(GLASSES_TO_FACE_IDXS_BY_FACE_KPTS[68])
 
 GLASSES_3D_LANDMARKS = None
 GLASSES_3D_LANDMARKS_DEFINED = None
 GLASSES_KEYPOINT_IDXS = sorted(GLASSES_TO_FACE_IDXS.keys())
+
+
+def configure_face_landmark_mapping(num_face_keypoints: int):
+    global GLASSES_TO_FACE_IDXS, GLASSES_KEYPOINT_IDXS
+
+    n = int(num_face_keypoints)
+    if n not in GLASSES_TO_FACE_IDXS_BY_FACE_KPTS:
+        supported = ", ".join(str(k) for k in sorted(GLASSES_TO_FACE_IDXS_BY_FACE_KPTS))
+        raise ValueError(f"Unsupported face landmark count {n}. Supported values: {supported}")
+
+    GLASSES_TO_FACE_IDXS = dict(GLASSES_TO_FACE_IDXS_BY_FACE_KPTS[n])
+    GLASSES_KEYPOINT_IDXS = sorted(GLASSES_TO_FACE_IDXS.keys())
 
 
 def load_glasses_3d_landmarks_from_xml(path):
@@ -171,6 +201,8 @@ def parse_args():
     )
     p.add_argument(
         "--light_angle_jitter_deg",
+        "--light_angle_jitter",
+        dest="light_angle_jitter_deg",
         type=float,
         default=35.0,
         help="Max absolute Euler jitter (degrees) applied to each light rotation component.",
@@ -184,7 +216,12 @@ def parse_args():
 
     # Dataset controls
     p.add_argument("--variants_per_image", type=int, default=1)
-    p.add_argument("--num_face_keypoints", type=int, default=68)
+    p.add_argument(
+        "--num_face_keypoints",
+        type=int,
+        default=None,
+        help="Number of input face landmarks. Supported: 68, 98. Default: infer from annotations.",
+    )
 
     # Annotation controls
     p.add_argument(
@@ -285,9 +322,97 @@ def get_face_landmarks_from_annotation(ann, num_kpts_face=None):
     if kpts.size % 3 != 0:
         raise ValueError("Annotation keypoints length is not multiple of 3")
     kpts = kpts.reshape(-1, 3)
+    if num_kpts_face is not None and kpts.shape[0] < int(num_kpts_face):
+        ann_id = ann.get("id", "<unknown>")
+        raise ValueError(
+            f"Annotation {ann_id} has only {kpts.shape[0]} keypoints; expected at least {int(num_kpts_face)}"
+        )
     if num_kpts_face is not None:
         kpts = kpts[: int(num_kpts_face)]
     return kpts[:, :2]
+
+
+def resolve_num_face_keypoints(coco, requested_num_face_keypoints=None):
+    supported_counts = sorted(GLASSES_TO_FACE_IDXS_BY_FACE_KPTS)
+    supported_set = set(supported_counts)
+
+    annotations = coco.get("annotations") or []
+    ann_counts = []
+    bad_ann_lengths = []
+    for ann in annotations:
+        keypoints = ann.get("keypoints")
+        if keypoints is None:
+            continue
+        if len(keypoints) % 3 != 0:
+            bad_ann_lengths.append((ann.get("id", "<unknown>"), len(keypoints)))
+            continue
+        ann_counts.append((ann.get("id", "<unknown>"), len(keypoints) // 3))
+
+    if bad_ann_lengths:
+        sample = ", ".join(f"ann {ann_id}: {length}" for ann_id, length in bad_ann_lengths[:5])
+        raise ValueError(f"Invalid annotation keypoints length(s), not divisible by 3: {sample}")
+
+    categories = coco.get("categories") or []
+    category_counts = []
+    for cat in categories:
+        cat_id = cat.get("id", "<unknown>")
+        num_keypoints = cat.get("num_keypoints")
+        if isinstance(num_keypoints, int) and num_keypoints > 0:
+            category_counts.append((cat_id, num_keypoints, "num_keypoints"))
+            continue
+
+        keypoints = cat.get("keypoints")
+        if isinstance(keypoints, list) and len(keypoints) > 0:
+            category_counts.append((cat_id, len(keypoints), "keypoints"))
+
+    if requested_num_face_keypoints is not None:
+        resolved = int(requested_num_face_keypoints)
+    else:
+        unique_ann_counts = sorted({count for _, count in ann_counts})
+        exact_supported_ann_counts = [count for count in unique_ann_counts if count in supported_set]
+        exact_supported_category_counts = sorted({count for _, count, _ in category_counts if count in supported_set})
+
+        if len(unique_ann_counts) == 1 and unique_ann_counts[0] in supported_set:
+            resolved = int(unique_ann_counts[0])
+        elif len(exact_supported_category_counts) == 1:
+            resolved = int(exact_supported_category_counts[0])
+        elif len(exact_supported_ann_counts) == 1:
+            resolved = int(exact_supported_ann_counts[0])
+        else:
+            ann_summary = ", ".join(str(v) for v in unique_ann_counts) if unique_ann_counts else "none"
+            cat_summary = ", ".join(str(v) for v in sorted({count for _, count, _ in category_counts})) if category_counts else "none"
+            supported = ", ".join(str(v) for v in supported_counts)
+            raise ValueError(
+                "Could not infer input face landmark count from annotations/categories. "
+                f"Annotation counts: {ann_summary}. Category counts: {cat_summary}. "
+                f"Pass --num_face_keypoints explicitly. Supported values: {supported}."
+            )
+
+    if resolved not in supported_set:
+        supported = ", ".join(str(v) for v in supported_counts)
+        raise ValueError(f"Unsupported --num_face_keypoints={resolved}. Supported values: {supported}")
+
+    too_short = [(ann_id, count) for ann_id, count in ann_counts if count < resolved]
+    if too_short:
+        sample = ", ".join(f"ann {ann_id}: {count}" for ann_id, count in too_short[:5])
+        raise ValueError(
+            f"Annotation(s) have fewer than {resolved} keypoints, which is incompatible with the selected face schema: {sample}"
+        )
+
+    conflicting_categories = [
+        (cat_id, count, source)
+        for cat_id, count, source in category_counts
+        if count != resolved
+    ]
+    if conflicting_categories:
+        sample = ", ".join(
+            f"category {cat_id} {source}={count}" for cat_id, count, source in conflicting_categories[:5]
+        )
+        raise ValueError(
+            f"Category metadata conflicts with the selected {resolved}-landmark schema: {sample}"
+        )
+
+    return resolved
 
 
 def draw_landmarks_with_indices(img, kpts, color=(0, 255, 0), idxs=None):
@@ -797,6 +922,10 @@ def main():
     with open(args.annotations, "r") as f:
         coco = json.load(f)
 
+    num_face_keypoints = resolve_num_face_keypoints(coco, args.num_face_keypoints)
+    configure_face_landmark_mapping(num_face_keypoints)
+    print(f"Using {num_face_keypoints}-landmark face schema for glasses pose fitting.")
+
     images = coco.get("images", [])
     annotations = coco.get("annotations", [])
     categories = coco.get("categories", [])
@@ -806,7 +935,7 @@ def main():
     # If requested, run PnP-only debug mode and exit.
     if args.pnp_only:
         print("Running PnP-only debug mode (no Blender rendering)...")
-        debug_pnp_only(coco, image_by_id, images_root, out_images_root, args.num_face_keypoints)
+        debug_pnp_only(coco, image_by_id, images_root, out_images_root, num_face_keypoints)
         return
 
     # Prepare COCO output category keypoints
@@ -817,6 +946,7 @@ def main():
         for cat in categories:
             if cat.get("id") in used_category_ids or len(used_category_ids) == 0:
                 cat["keypoints"] = list(new_kpt_names)
+                cat["num_keypoints"] = int(n_out_kpts)
                 cat["skeleton"] = []
     else:
         categories = [{
@@ -824,6 +954,7 @@ def main():
             "name": "face",
             "supercategory": "person",
             "keypoints": list(new_kpt_names),
+            "num_keypoints": int(n_out_kpts),
             "skeleton": [],
         }]
 
@@ -859,7 +990,7 @@ def main():
 
         w, h = int(img["width"]), int(img["height"])
         try:
-            landmarks_2d = get_face_landmarks_from_annotation(ann, num_kpts_face=args.num_face_keypoints)
+            landmarks_2d = get_face_landmarks_from_annotation(ann, num_kpts_face=num_face_keypoints)
         except Exception as e:
             print(f"Warning: failed to parse landmarks for {img_path}: {e}")
             continue
