@@ -40,6 +40,9 @@ import pose.models  # noqa: F401
 import pose.detectors  # noqa: F401
 
 
+LANDMARK_LABEL_INDICES = (0, 9, 26, 57, 63)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
@@ -95,6 +98,43 @@ def draw_landmarks(
             red = int(round(64.0 + 191.0 * c))
             draw_color = (0, 0, red)
         cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, draw_color, -1)
+
+
+def draw_landmark_labels(
+    frame: np.ndarray,
+    coords: np.ndarray,
+    indices: tuple[int, ...],
+    confidences: np.ndarray | None = None,
+) -> None:
+    """Draw small labels near selected landmarks."""
+    if coords is None or len(coords) == 0:
+        return
+    h, w = frame.shape[:2]
+    for idx in indices:
+        if idx < 0 or idx >= len(coords):
+            continue
+        xk, yk = coords[idx]
+        x = int(round(float(xk)))
+        y = int(round(float(yk)))
+
+        if confidences is not None and idx < len(confidences):
+            c = float(np.clip(confidences[idx], 0.0, 1.0))
+            text = f"{idx}:{c:.2f}"
+        else:
+            text = f"{idx}"
+
+        tx = max(0, min(w - 1, x + 4))
+        ty = max(0, min(h - 1, y - 4))
+        cv2.putText(
+            frame,
+            text,
+            (tx, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def _load_3d_landmarks_xml(xml_path: str) -> np.ndarray:
@@ -332,7 +372,12 @@ def _load_model_from_config(
 
     model = _build_model()
     try:
-        model.load_state_dict(state_dict, strict=bool(strict))
+        load_res = model.load_state_dict(state_dict, strict=bool(strict))
+        if not bool(strict):
+            missing = getattr(load_res, "missing_keys", [])
+            unexpected = getattr(load_res, "unexpected_keys", [])
+            if missing or unexpected:
+                print(f"[WARN] Base checkpoint load had missing={len(missing)} unexpected={len(unexpected)}")
     except RuntimeError as e:
         inferred = _infer_input_size_from_pe()
         if inferred is not None:
@@ -444,6 +489,22 @@ def _try_extract_norm_coords_batch(model_out: object) -> torch.Tensor | None:
     return coords_norm[..., :2]
 
 
+def _try_extract_pixel_coords_batch(model_out: object) -> torch.Tensor | None:
+    """Try to extract pixel-space (B, K, 2) coordinates from LOTR-style outputs."""
+    coords_px = None
+    if isinstance(model_out, tuple) and len(model_out) >= 2:
+        coords_px = model_out[1]
+    elif isinstance(model_out, dict):
+        coords_px = model_out.get("landmarks_pixel")
+    if not isinstance(coords_px, torch.Tensor):
+        return None
+    if coords_px.dim() != 3:
+        return None
+    if coords_px.size(-1) < 2:
+        return None
+    return coords_px[..., :2]
+
+
 def _try_extract_confidence_batch(model_out: object) -> torch.Tensor | None:
     """Try to extract LOTR landmark confidence tensor as (B, K)."""
     conf = None
@@ -451,6 +512,20 @@ def _try_extract_confidence_batch(model_out: object) -> torch.Tensor | None:
         conf = model_out[2]
     elif isinstance(model_out, dict):
         conf = model_out.get("landmark_confidence")
+
+    # New channel format support: confidence packed as the 3rd channel in
+    # landmark tensors, e.g. (B, K, 3) where [:, :, :2] are coords.
+    if conf is None:
+        packed = None
+        if isinstance(model_out, tuple) and len(model_out) >= 1 and isinstance(model_out[0], torch.Tensor):
+            packed = model_out[0]
+        elif isinstance(model_out, dict):
+            packed = model_out.get("landmarks_norm")
+            if not isinstance(packed, torch.Tensor):
+                packed = model_out.get("landmarks_pixel")
+        if isinstance(packed, torch.Tensor) and packed.dim() == 3 and packed.size(-1) >= 3:
+            conf = packed[..., 2]
+
     if not isinstance(conf, torch.Tensor):
         return None
     if conf.dim() == 3 and conf.size(-1) == 1:
@@ -468,6 +543,20 @@ def _get_cfg_input_size(cfg_raw: dict, *, fallback: Tuple[int, int]) -> Tuple[in
         except Exception:
             return fallback
     return fallback
+
+
+def _get_model_input_size(model: torch.nn.Module) -> Tuple[int, int] | None:
+    """Return model.input_size as (W, H) when available and valid."""
+    sz = getattr(model, "input_size", None)
+    if isinstance(sz, (tuple, list)) and len(sz) == 2:
+        try:
+            w = int(sz[0])
+            h = int(sz[1])
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            return None
+    return None
 
 
 def _infer_default_margin_from_landmarks_cfg(cfg_raw: dict) -> float:
@@ -592,7 +681,17 @@ def main():
         strict=False,
         ema_mode="auto",
     )
-    preprocess_size = _get_cfg_input_size(lm_cfg, fallback=(256, 256))
+    preprocess_size_cfg = _get_cfg_input_size(lm_cfg, fallback=(256, 256))
+    preprocess_size_model = _get_model_input_size(model)
+    if preprocess_size_model is not None:
+        preprocess_size = preprocess_size_model
+        if preprocess_size != preprocess_size_cfg:
+            print(
+                f"[WARN] landmarks config input_size={preprocess_size_cfg} differs from loaded model input_size={preprocess_size}; "
+                f"using model input_size for preprocessing."
+            )
+    else:
+        preprocess_size = preprocess_size_cfg
 
     if int(preprocess_size[0]) < 32 or int(preprocess_size[1]) < 32:
         print(f"[WARN] Very small preprocessing size {preprocess_size}. Did you mean e.g. 192 or 256?")
@@ -642,8 +741,15 @@ def main():
     print(f"Loaded detector model from {args.detector_config} | input_size={det_input_size}")
 
     if args.detector_margin is None:
-        margin_default = _infer_default_margin_from_landmarks_cfg(lm_cfg)
+        # Detector boxes are typically looser than GT annotation boxes used
+        # during training. Reusing training face_margin (often ~0.75) here can
+        # produce oversized crops and make landmarks appear too small/unstable.
+        margin_default = 0.25
         margin_arg = float(margin_default)
+        print(
+            f"Using detector margin default: {margin_arg:.2f}. "
+            "Use --detector-margin to override."
+        )
     else:
         margin_arg = float(args.detector_margin)
 
@@ -727,13 +833,22 @@ def main():
                         preds = model(batch)
 
                     # Decode either coordinate-regression outputs (LOTR) or heatmaps.
+                    # Prefer explicit pixel outputs when available to avoid
+                    # ambiguity between normalized/pixel channels.
+                    coords_px_batch = _try_extract_pixel_coords_batch(preds)
                     coords_norm_batch = _try_extract_norm_coords_batch(preds)
                     conf_batch = _try_extract_confidence_batch(preds)
-                    if coords_norm_batch is not None:
+                    if coords_px_batch is not None:
+                        coords = coords_px_batch[0].detach().float().cpu().numpy().astype(np.float32)
+                        if conf_batch is not None:
+                            kpts_conf = conf_batch[0].detach().float().cpu().numpy().astype(np.float32)
+                            kpts_conf = np.clip(kpts_conf, 0.0, 1.0)
+                    elif coords_norm_batch is not None:
                         coords_norm = coords_norm_batch[0].detach().float().cpu().numpy().astype(np.float32)
                         coords = coords_norm.copy()
                         coords[:, 0] *= float(preprocess_size[0])
                         coords[:, 1] *= float(preprocess_size[1])
+
                         if conf_batch is not None:
                             kpts_conf = conf_batch[0].detach().float().cpu().numpy().astype(np.float32)
                             kpts_conf = np.clip(kpts_conf, 0.0, 1.0)
@@ -765,6 +880,12 @@ def main():
 
                 if args.draw_landmarks and kpts_frame is not None:
                     draw_landmarks(frame_bgr, kpts_frame, color=(0, 0, 255), confidences=kpts_conf)
+                    draw_landmark_labels(
+                        frame_bgr,
+                        kpts_frame,
+                        indices=LANDMARK_LABEL_INDICES,
+                        confidences=kpts_conf,
+                    )
 
                 # If 3D template is provided, draw projected points and axes by default.
                 if obj_pts_3d is not None and pnp_sol is not None:

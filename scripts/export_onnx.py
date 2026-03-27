@@ -13,6 +13,12 @@ Examples:
   # Export LOTR pixel landmark outputs
   python scripts/export_onnx.py --config configs/xreal_lotr.yaml --checkpoint work_dirs/xreal_lotr/best.pth --output work_dirs/xreal_lotr/lotr_pixel.onnx --output-type coords_pixel
 
+    # Export LOTR per-landmark confidence head
+    python scripts/export_onnx.py --config configs/xreal_lotr.yaml --checkpoint work_dirs/xreal_lotr/best.pth --output work_dirs/xreal_lotr/lotr_confidence.onnx --output-type confidence
+
+    # Export LOTR coords_pixel + confidence in one ONNX
+    python scripts/export_onnx.py --config configs/xreal_lotr.yaml --checkpoint work_dirs/xreal_lotr/best.pth --output work_dirs/xreal_lotr/lotr_pixel_confidence.onnx --output-type coords_pixel_confidence
+
 Notes:
   - ONNX export typically requires the `onnx` Python package.
 """
@@ -127,7 +133,7 @@ class _OnnxOutputWrapper(torch.nn.Module):
         self.model = model
         self.output_type = str(output_type).lower().strip()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Any:
         out = self.model(x)
 
         # Dict outputs
@@ -138,6 +144,26 @@ class _OnnxOutputWrapper(torch.nn.Module):
                 return out["landmarks_pixel"]
             if self.output_type in ("coords_norm", "auto") and isinstance(out.get("landmarks_norm"), torch.Tensor):
                 return out["landmarks_norm"]
+            if self.output_type == "confidence":
+                for k in ("landmark_confidence", "confidence", "pred_confidence"):
+                    v = out.get(k)
+                    if isinstance(v, torch.Tensor):
+                        return v
+            if self.output_type == "coords_pixel_confidence":
+                px = out.get("landmarks_pixel")
+                conf = None
+                for k in ("landmark_confidence", "confidence", "pred_confidence"):
+                    v = out.get(k)
+                    if isinstance(v, torch.Tensor):
+                        conf = v
+                        break
+                if isinstance(px, torch.Tensor) and isinstance(conf, torch.Tensor):
+                    return px, conf
+            if self.output_type == "log_var":
+                for k in ("landmark_log_var", "log_var", "uncertainty", "pred_log_var"):
+                    v = out.get(k)
+                    if isinstance(v, torch.Tensor):
+                        return v
             # fallback: first tensor value
             for v in out.values():
                 if isinstance(v, torch.Tensor):
@@ -154,6 +180,13 @@ class _OnnxOutputWrapper(torch.nn.Module):
                 return out[0]
             if self.output_type == "coords_pixel" and len(out) >= 2 and isinstance(out[1], torch.Tensor):
                 return out[1]
+            if self.output_type == "confidence" and len(out) >= 3 and isinstance(out[2], torch.Tensor):
+                return out[2]
+            if self.output_type == "coords_pixel_confidence" and len(out) >= 3:
+                if isinstance(out[1], torch.Tensor) and isinstance(out[2], torch.Tensor):
+                    return out[1], out[2]
+            if self.output_type == "log_var" and len(out) >= 4 and isinstance(out[3], torch.Tensor):
+                return out[3]
 
             # Heatmap-style models return (pred_last, preds_all)
             if self.output_type in ("heatmaps", "auto") and isinstance(out[0], torch.Tensor):
@@ -170,6 +203,17 @@ class _OnnxOutputWrapper(torch.nn.Module):
             return out
 
         raise TypeError(f"Unsupported model output type for ONNX export: {type(out)}")
+
+
+def _has_confidence_output(out: Any) -> bool:
+    if isinstance(out, dict):
+        for k in ("landmark_confidence", "confidence", "pred_confidence"):
+            if isinstance(out.get(k), torch.Tensor):
+                return True
+        return False
+    if isinstance(out, (tuple, list)):
+        return len(out) >= 3 and isinstance(out[2], torch.Tensor)
+    return False
 
 
 def _resolve_export_spec(cfg: Dict[str, Any], args: argparse.Namespace) -> ExportSpec:
@@ -211,7 +255,7 @@ def main() -> None:
     parser.add_argument(
         "--output-type",
         default="auto",
-        choices=["auto", "heatmaps", "coords_norm", "coords_pixel"],
+        choices=["auto", "heatmaps", "coords_norm", "coords_pixel", "confidence", "log_var", "coords_pixel_confidence"],
         help="Which tensor to export when the model returns multiple outputs.",
     )
 
@@ -308,29 +352,47 @@ def main() -> None:
     model.eval()
     model.cpu()
 
-    # Wrap output selection to a single tensor for stable export.
+    # Wrap output selection for stable, explicit export outputs.
     export_model = _OnnxOutputWrapper(model, output_type=args.output_type).eval()
 
     h, w = spec.input_size_hw
     dummy = torch.randn(int(args.batch), 3, int(h), int(w), dtype=torch.float32)
 
+    # Quick dry-run to make export errors easier to interpret.
+    with torch.no_grad():
+        raw_out = model(dummy)
+        if args.output_type == "auto" and _has_confidence_output(raw_out):
+            print(
+                "[WARN] Model exposes a confidence head, but --output-type=auto exports the first tensor "
+                "(usually coordinates). Use --output-type confidence to export confidence scores."
+            )
+        out = export_model(dummy)
+    if isinstance(out, torch.Tensor):
+        output_names = ["output"]
+        output_shapes = [tuple(out.shape)]
+    elif isinstance(out, (tuple, list)) and len(out) > 0 and all(isinstance(v, torch.Tensor) for v in out):
+        if args.output_type == "coords_pixel_confidence" and len(out) == 2:
+            output_names = ["coords_pixel", "confidence"]
+        else:
+            output_names = [f"output_{i}" for i in range(len(out))]
+        output_shapes = [tuple(v.shape) for v in out]
+    else:
+        raise TypeError("Wrapped model output is not a Tensor or tuple/list of Tensors; cannot export")
+
     # Build dynamic axes mapping.
     dynamic_axes = None
     if args.dynamic_batch or args.dynamic_spatial:
-        dynamic_axes = {
-            "image": {0: "batch"},
-            "output": {0: "batch"},
-        }
+        dynamic_axes = {"image": {0: "batch"}}
+        for name in output_names:
+            dynamic_axes[name] = {0: "batch"}
         if args.dynamic_spatial:
             dynamic_axes["image"].update({2: "height", 3: "width"})
 
-    # Quick dry-run to make export errors easier to interpret.
-    with torch.no_grad():
-        out = export_model(dummy)
-    if not isinstance(out, torch.Tensor):
-        raise TypeError("Wrapped model output is not a Tensor; cannot export")
-
-    print(f"Exporting model='{spec.model_name}' input=({args.batch},3,{h},{w}) -> output_shape={tuple(out.shape)}")
+    if len(output_shapes) == 1:
+        shape_msg = str(output_shapes[0])
+    else:
+        shape_msg = ", ".join(f"{n}:{s}" for n, s in zip(output_names, output_shapes))
+    print(f"Exporting model='{spec.model_name}' input=({args.batch},3,{h},{w}) -> output_shape={shape_msg}")
 
     torch.onnx.export(
         export_model,
@@ -340,7 +402,7 @@ def main() -> None:
         opset_version=int(args.opset),
         do_constant_folding=True,
         input_names=["image"],
-        output_names=["output"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
     )
 
