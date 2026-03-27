@@ -129,7 +129,14 @@ class SmoothWingLoss(nn.Module):
         self, 
         w: float = 10.0, 
         eps: float = 2.0, 
-        t: float = 2.0
+        t: float = 2.0,
+        use_uncertainty: bool = False,
+        log_var_min: float = -6.0,
+        log_var_max: float = 6.0,
+        confidence_supervision_weight: float = 0.05,
+        confidence_target_sigma: float = 0.05,
+        lambda_conf: Optional[float] = None,
+        sigma: Optional[float] = None,
     ):
         super().__init__()
         assert 0 < t < w, f"Inner threshold t must be in (0, w), got t={t}, w={w}"
@@ -137,6 +144,16 @@ class SmoothWingLoss(nn.Module):
         self.w = w
         self.eps = eps
         self.t = t
+        self.use_uncertainty = bool(use_uncertainty)
+        self.log_var_min = float(log_var_min)
+        self.log_var_max = float(log_var_max)
+        # Backward/forward-compatible aliases for config friendliness.
+        if lambda_conf is not None:
+            confidence_supervision_weight = float(lambda_conf)
+        if sigma is not None:
+            confidence_target_sigma = float(sigma)
+        self.confidence_supervision_weight = float(confidence_supervision_weight)
+        self.confidence_target_sigma = float(confidence_target_sigma)
         
         # Compute smoothing constants for continuity
         # At x = t: s*t^2 = w*ln(1 + t/eps) + c1
@@ -157,7 +174,9 @@ class SmoothWingLoss(nn.Module):
         pred: torch.Tensor, 
         target: torch.Tensor,
         visible: Optional[torch.Tensor] = None,
-        sample_weight: Optional[torch.Tensor] = None
+        sample_weight: Optional[torch.Tensor] = None,
+        pred_log_var: Optional[torch.Tensor] = None,
+        pred_confidence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute Smooth-Wing loss between predicted and target landmarks.
@@ -173,6 +192,37 @@ class SmoothWingLoss(nn.Module):
         """
         diff = pred - target
         abs_diff = torch.abs(diff)
+        # Per-landmark geometric error and a per-sample normalization scale.
+        point_err = torch.linalg.norm(diff, dim=-1)  # (B, N)
+
+        # Normalize error by face bbox diagonal in target-landmark space.
+        # This keeps confidence targets scale-consistent across face sizes.
+        x_t = target[..., 0]
+        y_t = target[..., 1]
+        if visible is not None:
+            vis = visible > 0
+            x_min = torch.where(vis, x_t, torch.full_like(x_t, float("inf"))).min(dim=1).values
+            x_max = torch.where(vis, x_t, torch.full_like(x_t, float("-inf"))).max(dim=1).values
+            y_min = torch.where(vis, y_t, torch.full_like(y_t, float("inf"))).min(dim=1).values
+            y_max = torch.where(vis, y_t, torch.full_like(y_t, float("-inf"))).max(dim=1).values
+            no_vis = ~(vis.any(dim=1))
+            if no_vis.any():
+                x_min_all = x_t.min(dim=1).values
+                x_max_all = x_t.max(dim=1).values
+                y_min_all = y_t.min(dim=1).values
+                y_max_all = y_t.max(dim=1).values
+                x_min = torch.where(no_vis, x_min_all, x_min)
+                x_max = torch.where(no_vis, x_max_all, x_max)
+                y_min = torch.where(no_vis, y_min_all, y_min)
+                y_max = torch.where(no_vis, y_max_all, y_max)
+        else:
+            x_min = x_t.min(dim=1).values
+            x_max = x_t.max(dim=1).values
+            y_min = y_t.min(dim=1).values
+            y_max = y_t.max(dim=1).values
+
+        face_diag = torch.sqrt((x_max - x_min).clamp(min=1e-6) ** 2 + (y_max - y_min).clamp(min=1e-6) ** 2)
+        norm_error = point_err / face_diag.unsqueeze(1)
         
         # Three regions:
         # 1. |x| < t: L2-like region
@@ -193,14 +243,56 @@ class SmoothWingLoss(nn.Module):
         
         # Sum over coordinates
         loss = loss.sum(dim=-1)  # (B, N)
+
+        # Optional heteroscedastic uncertainty weighting.
+        # NLL form: exp(-s) * L + s, where s = log variance.
+        if self.use_uncertainty and pred_log_var is not None:
+            s = pred_log_var
+            if s.dim() == 3 and s.shape[-1] == 1:
+                s = s.squeeze(-1)
+            if s.shape != loss.shape:
+                raise ValueError(
+                    f"pred_log_var must have shape {tuple(loss.shape)} (or [...,1]), got {tuple(s.shape)}"
+                )
+            s = torch.clamp(s, min=self.log_var_min, max=self.log_var_max)
+            loss = torch.exp(-s) * loss + s
+
+        conf_loss = None
+        if self.confidence_supervision_weight > 0.0:
+            sig = max(self.confidence_target_sigma, 1e-6)
+            # Detach target so confidence branch does not backprop through target construction.
+            target_conf = torch.exp(-(norm_error.detach() ** 2) / (2.0 * sig * sig)).clamp(0.0, 1.0)
+            if pred_confidence is not None:
+                pred_conf = pred_confidence
+                if pred_conf.dim() == 3 and pred_conf.shape[-1] == 1:
+                    pred_conf = pred_conf.squeeze(-1)
+                if pred_conf.shape != target_conf.shape:
+                    raise ValueError(
+                        f"pred_confidence must have shape {tuple(target_conf.shape)} (or [...,1]), got {tuple(pred_conf.shape)}"
+                    )
+                pred_conf = pred_conf.clamp(0.0, 1.0)
+            elif self.use_uncertainty and pred_log_var is not None:
+                pred_conf = torch.sigmoid(-s)
+            else:
+                pred_conf = None
+            if pred_conf is not None:
+                conf_loss = (pred_conf - target_conf) ** 2  # (B, N)
         
         # Apply visibility mask
         if visible is not None:
             loss = loss * visible
             num_visible = visible.sum(dim=1).clamp(min=1)
             loss = loss.sum(dim=1) / num_visible
+            if conf_loss is not None:
+                conf_loss = conf_loss * visible
+                conf_loss = conf_loss.sum(dim=1) / num_visible
         else:
             loss = loss.mean(dim=1)
+            if conf_loss is not None:
+                conf_loss = conf_loss.mean(dim=1)
+
+        if conf_loss is not None:
+            loss = loss + self.confidence_supervision_weight * conf_loss
             
         # Apply sample weights
         if sample_weight is not None:

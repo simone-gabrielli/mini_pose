@@ -91,7 +91,7 @@ def _infer_landmarks_on_crop(
     face_bgr: np.ndarray,
     num_keypoints: int,
     input_size: Tuple[int, int],
-) -> Tuple[np.ndarray, Tuple[int, int]]:
+) -> Tuple[np.ndarray, Tuple[int, int], Optional[np.ndarray]]:
     """Returns predicted coords in resized crop pixel space + heatmap size.
 
     Important: preprocessing here mirrors the training/val pipeline:
@@ -131,8 +131,8 @@ def _infer_landmarks_on_crop(
             if isinstance(lm, torch.Tensor):
                 model_out = lm
 
-        # LOTR returns (normalized_coords, pixel_coords)
-        if isinstance(model_out, tuple) and len(model_out) == 2:
+        # LOTR returns (normalized_coords, pixel_coords [, confidence])
+        if isinstance(model_out, tuple) and len(model_out) >= 2:
             a, b = model_out
             if isinstance(b, torch.Tensor) and b.dim() == 3 and b.shape[-1] in (2, 3):
                 coords = b[0].detach().cpu().numpy()
@@ -172,6 +172,16 @@ def _infer_landmarks_on_crop(
     with torch.no_grad():
         out = model(img_t)
 
+        pred_conf: Optional[np.ndarray] = None
+
+        if isinstance(out, tuple) and len(out) >= 3 and isinstance(out[2], torch.Tensor):
+            conf_t = out[2]
+            if conf_t.dim() == 3 and conf_t.shape[-1] == 1:
+                conf_t = conf_t.squeeze(-1)
+            if conf_t.dim() == 2:
+                pred_conf = conf_t[0].detach().cpu().numpy().astype(np.float32)
+                pred_conf = np.clip(pred_conf, 0.0, 1.0)
+
         # Prefer LOTR normalized coordinates when available.
         # Rationale: some checkpoints were trained with data.input_size=192 but
         # the instantiated model may still have model.input_size=(256,256)
@@ -180,19 +190,19 @@ def _infer_landmarks_on_crop(
         # inconsistent with the actual preprocessing resize used here.
         # Normalized coords remain consistent and we can scale them to the
         # current resized-crop frame (W_face,H_face).
-        if isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], torch.Tensor):
+        if isinstance(out, tuple) and len(out) >= 2 and isinstance(out[0], torch.Tensor):
             t = out[0]
             if t.dim() == 3 and t.shape[-1] == 2:
                 coords_norm = t[0].detach().cpu().numpy()  # (N,2) in [0,1]
                 coords_px = coords_norm.copy()
                 coords_px[:, 0] *= float(W_face)
                 coords_px[:, 1] *= float(H_face)
-                return coords_px, (H_face, W_face)
+                return coords_px, (H_face, W_face), pred_conf
 
         # Fall back to any explicit pixel outputs (non-LOTR or older exports).
         coords_px = _extract_landmarks_px(out)
         if coords_px is not None:
-            return coords_px, (H_face, W_face)
+            return coords_px, (H_face, W_face), pred_conf
 
         preds_last = _extract_heatmaps_last(out)
 
@@ -211,7 +221,7 @@ def _infer_landmarks_on_crop(
     coords_px[:, 0] *= (W_face / float(W_hm))
     coords_px[:, 1] *= (H_face / float(H_hm))
 
-    return coords_px, (H_hm, W_hm)
+    return coords_px, (H_hm, W_hm), None
 
 
 def _load_model_from_config(
@@ -341,11 +351,23 @@ def _load_model_from_config(
     return model, cfg, num_keypoints
 
 
-def _draw_keypoints(img_bgr: np.ndarray, kpts: np.ndarray, color_bgr: Tuple[int, int, int], radius: int) -> None:
-    for xk, yk, vis in kpts:
+def _draw_keypoints(
+    img_bgr: np.ndarray,
+    kpts: np.ndarray,
+    color_bgr: Tuple[int, int, int],
+    radius: int,
+    confidences: Optional[np.ndarray] = None,
+) -> None:
+    for i, (xk, yk, vis) in enumerate(kpts):
         if vis <= 0:
             continue
-        cv2.circle(img_bgr, (int(round(xk)), int(round(yk))), radius, color_bgr, -1)
+        draw_color = color_bgr
+        if confidences is not None and color_bgr == (0, 0, 255):
+            # Keep low-confidence points visible, but dimmer red.
+            c = float(np.clip(confidences[i], 0.0, 1.0)) if i < len(confidences) else 0.0
+            red = int(round(64.0 + 191.0 * c))
+            draw_color = (0, 0, red)
+        cv2.circle(img_bgr, (int(round(xk)), int(round(yk))), radius, draw_color, -1)
 
 
 def _load_coco_samples(
@@ -592,7 +614,7 @@ def main():
         x1, y1, x2, y2 = crop_xyxy
         face_bgr = _crop_from_xyxy(img_bgr, x1, y1, x2, y2)
 
-        pred_px, pred_space = _infer_landmarks_on_crop(
+        pred_px, pred_space, pred_conf = _infer_landmarks_on_crop(
             model,
             device=device,
             face_bgr=face_bgr,
@@ -641,7 +663,7 @@ def main():
         if not args.no_draw_gt and gt_kpts is not None:
             _draw_keypoints(viz, gt_kpts, color_bgr=(0, 255, 0), radius=2)  # GT green
         if not args.no_draw_pred:
-            _draw_keypoints(viz, pred_kpts, color_bgr=(0, 0, 255), radius=2)  # pred red
+            _draw_keypoints(viz, pred_kpts, color_bgr=(0, 0, 255), radius=2, confidences=pred_conf)  # pred red scaled by confidence
         if args.draw_bbox:
             cv2.rectangle(viz, (x1, y1), (x2, y2), (255, 0, 0), 1)
 

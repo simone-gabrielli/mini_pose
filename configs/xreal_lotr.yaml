@@ -134,6 +134,7 @@ model:
   upsampling_layers: 2       # 2 layers = 4x upsampling (8x8 -> 32x32)
   pretrained: true
   constrain_coords: false
+  predict_confidence: true
 
 loss:
   name: smooth_wing
@@ -141,6 +142,10 @@ loss:
   w: 10.0                    # Outer threshold
   eps: 2.0                   # Steepness parameter
   t: 2.0                     # Inner threshold for L2 region
+  use_uncertainty: true      # Learn per-landmark confidence via heteroscedastic NLL
+  lambda_conf: 0.08
+  sigma: 0.05
+  confidence_correct_thresh: 0.05
 
 train:
   epochs: 200

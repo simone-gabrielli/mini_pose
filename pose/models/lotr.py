@@ -365,6 +365,8 @@ class LOTR(PoseModel):
         input_size: Tuple[int, int] = (256, 256),
         constrain_coords: bool = True,
         prediction_output_dim: int = 2,  # 2 for 2D, 3 for 3D landmarks
+        predict_confidence: bool = True,
+        enable_confidence_head: Optional[bool] = None,
         **kwargs  # Accept extra kwargs for compatibility
     ):
         super().__init__()
@@ -373,6 +375,9 @@ class LOTR(PoseModel):
         self.d_model = d_model
         self.input_size = input_size
         self.prediction_output_dim = prediction_output_dim
+        if enable_confidence_head is not None:
+            predict_confidence = bool(enable_confidence_head)
+        self.predict_confidence = bool(predict_confidence)
         
         # Build backbone
         self.backbone, backbone_channels = self._build_backbone(backbone, pretrained)
@@ -436,6 +441,26 @@ class LOTR(PoseModel):
             dropout=dropout,
             constrain_coords=constrain_coords,
         )
+
+        # Predict per-landmark confidence logits (2-way softmax: low/high confidence).
+        self.confidence_head = LandmarkPredictionHead(
+            d_model=d_model,
+            hidden_dim=dim_feedforward,
+            num_hidden_layers=2,
+            output_dim=2,
+            dropout=dropout,
+            constrain_coords=False,
+        )
+
+        # Separate uncertainty head used by heteroscedastic regression loss.
+        self.uncertainty_head = LandmarkPredictionHead(
+            d_model=d_model,
+            hidden_dim=dim_feedforward,
+            num_hidden_layers=2,
+            output_dim=1,
+            dropout=dropout,
+            constrain_coords=False,
+        )
         
         self._init_weights()
         
@@ -476,7 +501,7 @@ class LOTR(PoseModel):
             if self.input_proj.bias is not None:
                 nn.init.zeros_(self.input_proj.bias)
                 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
         
@@ -488,6 +513,8 @@ class LOTR(PoseModel):
             
             For compatibility with trainer:
             - landmarks_pixel: (B, N, 2) coordinates scaled to image size
+            - landmark_confidence: (B, N) confidence scores in [0, 1]
+            - landmark_log_var: (B, N) predicted log-variance
         """
         B = x.size(0)
         
@@ -530,6 +557,19 @@ class LOTR(PoseModel):
         
         # 8. Predict coordinates
         landmarks_norm = self.prediction_head(decoder_out)  # (B, N, 2)
+
+        # 9. Predict uncertainty/confidence per landmark
+        if self.predict_confidence:
+            confidence_logits = self.confidence_head(decoder_out)  # (B, N, 2)
+            landmark_confidence = torch.softmax(confidence_logits, dim=-1)[..., 1]  # (B, N)
+            landmark_log_var = self.uncertainty_head(decoder_out).squeeze(-1)  # (B, N)
+        else:
+            landmark_log_var = torch.zeros(
+                (B, self.num_keypoints),
+                dtype=decoder_out.dtype,
+                device=decoder_out.device,
+            )
+            landmark_confidence = torch.ones_like(landmark_log_var)
         
         # Scale to image size for compatibility with existing evaluation
         H_img, W_img = self.input_size
@@ -537,11 +577,11 @@ class LOTR(PoseModel):
         landmarks_pixel[..., 0] *= W_img
         landmarks_pixel[..., 1] *= H_img
         
-        return landmarks_norm, landmarks_pixel
+        return landmarks_norm, landmarks_pixel, landmark_confidence, landmark_log_var
     
     def get_landmarks_pixel(self, x: torch.Tensor) -> torch.Tensor:
         """Convenience method to get pixel coordinates directly."""
-        _, landmarks_pixel = self.forward(x)
+        _, landmarks_pixel, _, _ = self.forward(x)
         return landmarks_pixel
     
     def generate_sample_visualization(
@@ -561,9 +601,11 @@ class LOTR(PoseModel):
         img_tensor = sample["image"].unsqueeze(0).to(device)
         
         with torch.no_grad():
-            _, landmarks_pixel = self.forward(img_tensor)
+            _, landmarks_pixel, landmark_confidence, _ = self.forward(img_tensor)
         
         landmarks = landmarks_pixel[0].cpu().numpy()  # (N, 2)
+        confidence = landmark_confidence[0].cpu().numpy().astype(np.float32)
+        confidence = np.clip(confidence, 0.0, 1.0)
         
         # Get image for display
         img_np = sample["image"].cpu().numpy().transpose(1, 2, 0)
@@ -584,9 +626,34 @@ class LOTR(PoseModel):
         ax.scatter(keypts_gt[:, 0], keypts_gt[:, 1], c='lime', s=8, 
                    label='GT', alpha=0.8, marker='o')
         
-        # Plot predicted landmarks in red
-        ax.scatter(landmarks[:, 0], landmarks[:, 1], c='red', s=8, 
-                   label='Pred', alpha=0.8, marker='x')
+        # Plot predicted landmarks in red with intensity proportional to confidence.
+        min_red = 0.2
+        cmin = float(confidence.min())
+        cmax = float(confidence.max())
+        if (cmax - cmin) > 1e-6:
+            conf_vis = (confidence - cmin) / (cmax - cmin)
+        else:
+            conf_vis = confidence
+        red = min_red + (1.0 - min_red) * conf_vis
+        pred_colors = np.stack([red, np.zeros_like(red), np.zeros_like(red)], axis=1)
+        ax.scatter(landmarks[:, 0], landmarks[:, 1], c=pred_colors, s=10,
+               label='Pred (red=confidence)', alpha=0.9, marker='x')
+
+        # Annotate a random subset with confidence values for quick debugging.
+        n_pts = int(landmarks.shape[0])
+        if n_pts > 0:
+            rng = np.random.default_rng()
+            num_labels = min(8, n_pts)
+            label_idx = rng.choice(n_pts, size=num_labels, replace=False)
+            for i in label_idx:
+                ax.text(
+                    float(landmarks[i, 0]) + 1.5,
+                    float(landmarks[i, 1]) + 1.5,
+                    f"{float(confidence[i]):.2f}",
+                    fontsize=6,
+                    color='yellow',
+                    bbox=dict(facecolor='black', alpha=0.45, pad=0.4, edgecolor='none'),
+                )
         
         # Draw connections between GT and predictions for error visualization
         for i in range(len(landmarks)):

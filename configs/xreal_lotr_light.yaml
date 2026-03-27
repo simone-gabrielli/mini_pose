@@ -129,12 +129,17 @@ model:
   use_upsampling: false      # Skip upsampling for speed
   pretrained: true
   constrain_coords: false
+  predict_confidence: true
 
 loss:
   name: smooth_wing
   w: 10.0
   eps: 2.0
   t: 2.0
+  use_uncertainty: true
+  lambda_conf: 0.08
+  sigma: 0.05
+  confidence_correct_thresh: 0.05
 
 train:
   epochs: 250

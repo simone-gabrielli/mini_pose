@@ -369,9 +369,29 @@ class Trainer:
             raise KeyError("Config is missing required key: loss.name")
 
         LossCls = LOSS_REGISTRY[loss_cfg["name"]]
-        # Pass loss_cfg kwargs through (excluding 'name') so losses can be configured.
-        loss_kwargs = {k: v for k, v in loss_cfg.items() if k != "name"}
+        # Pass only kwargs the loss constructor accepts.
+        raw_loss_kwargs = {k: v for k, v in loss_cfg.items() if k != "name"}
+        try:
+            loss_init_sig = inspect.signature(LossCls.__init__)
+            loss_init_params = loss_init_sig.parameters
+            loss_accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in loss_init_params.values())
+            if loss_accepts_var_kw:
+                loss_kwargs = raw_loss_kwargs
+            else:
+                loss_allowed = {name for name in loss_init_params.keys() if name != "self"}
+                loss_kwargs = {k: v for k, v in raw_loss_kwargs.items() if k in loss_allowed}
+        except Exception:
+            loss_kwargs = raw_loss_kwargs
+
         self.criterion = LossCls(**loss_kwargs).to(self.device)
+        try:
+            crit_sig = inspect.signature(self.criterion.forward)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in crit_sig.parameters.values())
+            self._criterion_accepts_pred_log_var = has_var_kw or ("pred_log_var" in crit_sig.parameters)
+            self._criterion_accepts_pred_confidence = has_var_kw or ("pred_confidence" in crit_sig.parameters)
+        except Exception:
+            self._criterion_accepts_pred_log_var = False
+            self._criterion_accepts_pred_confidence = False
 
 
         # Optimizer / Scheduler
@@ -606,10 +626,16 @@ class Trainer:
                     visible = batch["visible"].to(self.device)
 
                     out = self.model(imgs)
+                    pred_log_var = None
+                    pred_confidence = None
 
                     # LOTR returns (normalized_coords, pixel_coords)
-                    if isinstance(out, tuple) and len(out) == 2:
-                        landmarks_norm, _ = out
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        landmarks_norm = out[0]
+                        if len(out) >= 4 and isinstance(out[3], torch.Tensor):
+                            pred_log_var = out[3]
+                        if len(out) >= 3 and isinstance(out[2], torch.Tensor):
+                            pred_confidence = out[2]
                         # Prefer normalized coords to avoid any dependency on
                         # model.input_size scaling. Convert to pixel space using
                         # the *actual* model input tensor size.
@@ -625,7 +651,12 @@ class Trainer:
                             B = imgs.size(0)
                             preds_2d = preds_2d.view(B, -1, 2)
 
-                    loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
+                    loss_kwargs = {"sample_weight": sample_weight}
+                    if pred_log_var is not None and self._criterion_accepts_pred_log_var:
+                        loss_kwargs["pred_log_var"] = pred_log_var
+                    if pred_confidence is not None and self._criterion_accepts_pred_confidence:
+                        loss_kwargs["pred_confidence"] = pred_confidence
+                    loss = self.criterion(preds_2d, targets_2d, visible, **loss_kwargs)
 
                 else:
                     # Heatmap-based training
@@ -688,6 +719,8 @@ class Trainer:
 
         coord_preds: list[np.ndarray] = []
         coord_targets: list[np.ndarray] = []
+        conf_vals: list[np.ndarray] = []
+        norm_err_vals: list[np.ndarray] = []
         is_coord_regression = loss_name in coord_regression_losses
 
         det_iou_sum = 0.0
@@ -759,9 +792,15 @@ class Trainer:
                     targets_2d = batch["keypoints"][:, :, :2].to(self.device)
                     visible = batch["visible"].to(self.device)
                     out = self.model(imgs)
+                    pred_log_var = None
+                    pred_confidence = None
 
-                    if isinstance(out, tuple) and len(out) == 2:
-                        landmarks_norm, _ = out
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        landmarks_norm = out[0]
+                        if len(out) >= 4 and isinstance(out[3], torch.Tensor):
+                            pred_log_var = out[3]
+                        if len(out) >= 3 and isinstance(out[2], torch.Tensor):
+                            pred_confidence = out[2]
                         preds_2d = landmarks_norm[..., :2].clone()
                         H_in = float(imgs.shape[-2])
                         W_in = float(imgs.shape[-1])
@@ -773,12 +812,39 @@ class Trainer:
                             B = imgs.size(0)
                             preds_2d = preds_2d.view(B, -1, 2)
 
-                    loss = self.criterion(preds_2d, targets_2d, visible, sample_weight=sample_weight)
+                    loss_kwargs = {"sample_weight": sample_weight}
+                    if pred_log_var is not None and self._criterion_accepts_pred_log_var:
+                        loss_kwargs["pred_log_var"] = pred_log_var
+                    if pred_confidence is not None and self._criterion_accepts_pred_confidence:
+                        loss_kwargs["pred_confidence"] = pred_confidence
+                    loss = self.criterion(preds_2d, targets_2d, visible, **loss_kwargs)
                     preds_last = None
 
                     for b in range(preds_2d.size(0)):
-                        coord_preds.append(preds_2d[b].cpu().numpy())
-                        coord_targets.append(targets_2d[b].cpu().numpy())
+                        p_np = preds_2d[b].cpu().numpy()
+                        t_np = targets_2d[b].cpu().numpy()
+                        coord_preds.append(p_np)
+                        coord_targets.append(t_np)
+
+                        if pred_confidence is not None:
+                            c_np = pred_confidence[b].detach().cpu().numpy().astype(np.float32)
+                            v_np = visible[b].detach().cpu().numpy() > 0
+                            if v_np.any():
+                                t_vis = t_np[v_np]
+                                p_vis = p_np[v_np]
+                                c_vis = c_np[v_np]
+                            else:
+                                t_vis = t_np
+                                p_vis = p_np
+                                c_vis = c_np
+
+                            x_rng = float(np.max(t_vis[:, 0]) - np.min(t_vis[:, 0]))
+                            y_rng = float(np.max(t_vis[:, 1]) - np.min(t_vis[:, 1]))
+                            face_diag = max((x_rng * x_rng + y_rng * y_rng) ** 0.5, 1e-6)
+                            err_norm = np.linalg.norm(p_vis - t_vis, axis=1) / face_diag
+
+                            conf_vals.append(c_vis.astype(np.float32))
+                            norm_err_vals.append(err_norm.astype(np.float32))
 
                 else:
                     targets = batch["heatmaps"].to(self.device)
@@ -844,6 +910,40 @@ class Trainer:
                 coord_targets_arr = np.stack(coord_targets)
                 metrics["pck"] = float(compute_pck(coord_preds_arr, coord_targets_arr))
                 metrics["nme"] = float(compute_nme(coord_preds_arr, coord_targets_arr))
+            except Exception:
+                pass
+
+        if conf_vals and norm_err_vals:
+            try:
+                conf_all = np.concatenate(conf_vals)
+                err_all = np.concatenate(norm_err_vals)
+                if conf_all.size >= 2 and np.std(conf_all) > 1e-8 and np.std(err_all) > 1e-8:
+                    metrics["conf_err_corr"] = float(np.corrcoef(conf_all, err_all)[0, 1])
+
+                err_thr = float(self.cfg.get("loss", {}).get("confidence_correct_thresh", 0.05))
+                is_correct = err_all < err_thr
+                if np.any(is_correct):
+                    metrics["conf_mean_correct"] = float(np.mean(conf_all[is_correct]))
+                if np.any(~is_correct):
+                    metrics["conf_mean_incorrect"] = float(np.mean(conf_all[~is_correct]))
+
+                # Simple calibration: ECE over confidence bins against correctness.
+                bins = np.linspace(0.0, 1.0, 6)
+                ece = 0.0
+                n = float(conf_all.size)
+                for i in range(len(bins) - 1):
+                    lo = bins[i]
+                    hi = bins[i + 1]
+                    if i == len(bins) - 2:
+                        m = (conf_all >= lo) & (conf_all <= hi)
+                    else:
+                        m = (conf_all >= lo) & (conf_all < hi)
+                    if not np.any(m):
+                        continue
+                    bin_conf = float(np.mean(conf_all[m]))
+                    bin_acc = float(np.mean(is_correct[m].astype(np.float32)))
+                    ece += abs(bin_conf - bin_acc) * (float(np.sum(m)) / n)
+                metrics["conf_ece"] = float(ece)
             except Exception:
                 pass
         return metrics

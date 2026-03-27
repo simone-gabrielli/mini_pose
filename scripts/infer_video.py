@@ -81,10 +81,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def draw_landmarks(frame: np.ndarray, coords: np.ndarray, color: Tuple[int, int, int] = (0, 0, 255)):
+def draw_landmarks(
+    frame: np.ndarray,
+    coords: np.ndarray,
+    color: Tuple[int, int, int] = (0, 0, 255),
+    confidences: np.ndarray | None = None,
+):
     """Draw 2D landmark points (x,y) onto a BGR frame."""
-    for (xk, yk) in coords:
-        cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, color, -1)
+    for i, (xk, yk) in enumerate(coords):
+        draw_color = color
+        if confidences is not None and color == (0, 0, 255):
+            c = float(np.clip(confidences[i], 0.0, 1.0)) if i < len(confidences) else 0.0
+            red = int(round(64.0 + 191.0 * c))
+            draw_color = (0, 0, red)
+        cv2.circle(frame, (int(round(float(xk))), int(round(float(yk)))), 2, draw_color, -1)
 
 
 def _load_3d_landmarks_xml(xml_path: str) -> np.ndarray:
@@ -418,11 +428,13 @@ def _try_extract_norm_coords_batch(model_out: object) -> torch.Tensor | None:
     Returns:
       - coords_norm: (B, K, 2) float tensor in [0,1] normalized space, or None.
     """
-    if not isinstance(model_out, tuple):
+    coords_norm = None
+    if isinstance(model_out, tuple) and len(model_out) >= 2:
+        coords_norm = model_out[0]
+    elif isinstance(model_out, dict):
+        coords_norm = model_out.get("landmarks_norm")
+    else:
         return None
-    if len(model_out) < 2:
-        return None
-    coords_norm = model_out[0]
     if not isinstance(coords_norm, torch.Tensor):
         return None
     if coords_norm.dim() != 3:
@@ -430,6 +442,22 @@ def _try_extract_norm_coords_batch(model_out: object) -> torch.Tensor | None:
     if coords_norm.size(-1) < 2:
         return None
     return coords_norm[..., :2]
+
+
+def _try_extract_confidence_batch(model_out: object) -> torch.Tensor | None:
+    """Try to extract LOTR landmark confidence tensor as (B, K)."""
+    conf = None
+    if isinstance(model_out, tuple) and len(model_out) >= 3:
+        conf = model_out[2]
+    elif isinstance(model_out, dict):
+        conf = model_out.get("landmark_confidence")
+    if not isinstance(conf, torch.Tensor):
+        return None
+    if conf.dim() == 3 and conf.size(-1) == 1:
+        conf = conf.squeeze(-1)
+    if conf.dim() != 2:
+        return None
+    return conf
 
 
 def _get_cfg_input_size(cfg_raw: dict, *, fallback: Tuple[int, int]) -> Tuple[int, int]:
@@ -685,6 +713,7 @@ def main():
                 face_bgr = frame_bgr[y1:y2, x1:x2]
 
                 kpts_frame = None
+                kpts_conf = None
                 pnp_sol = None
                 if face_bgr.size != 0:
                     if args.draw_crop_box:
@@ -699,11 +728,15 @@ def main():
 
                     # Decode either coordinate-regression outputs (LOTR) or heatmaps.
                     coords_norm_batch = _try_extract_norm_coords_batch(preds)
+                    conf_batch = _try_extract_confidence_batch(preds)
                     if coords_norm_batch is not None:
                         coords_norm = coords_norm_batch[0].detach().float().cpu().numpy().astype(np.float32)
                         coords = coords_norm.copy()
                         coords[:, 0] *= float(preprocess_size[0])
                         coords[:, 1] *= float(preprocess_size[1])
+                        if conf_batch is not None:
+                            kpts_conf = conf_batch[0].detach().float().cpu().numpy().astype(np.float32)
+                            kpts_conf = np.clip(kpts_conf, 0.0, 1.0)
                     else:
                         preds_last = _extract_preds_last(preds)[0].detach().cpu()
                         coords = decode_heatmaps(preds_last)
@@ -731,7 +764,7 @@ def main():
                             pnp_sol = pnp[0]
 
                 if args.draw_landmarks and kpts_frame is not None:
-                    draw_landmarks(frame_bgr, kpts_frame, color=(0, 0, 255))
+                    draw_landmarks(frame_bgr, kpts_frame, color=(0, 0, 255), confidences=kpts_conf)
 
                 # If 3D template is provided, draw projected points and axes by default.
                 if obj_pts_3d is not None and pnp_sol is not None:
