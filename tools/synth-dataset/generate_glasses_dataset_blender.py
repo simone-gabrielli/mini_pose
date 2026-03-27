@@ -332,6 +332,56 @@ def get_face_landmarks_from_annotation(ann, num_kpts_face=None):
     return kpts[:, :2]
 
 
+def _annotation_selection_score(ann):
+    """Score annotation for per-image selection; larger bbox/area is preferred."""
+    bbox = ann.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        try:
+            w = float(bbox[2])
+            h = float(bbox[3])
+            if np.isfinite(w) and np.isfinite(h) and w > 0 and h > 0:
+                return w * h
+        except Exception:
+            pass
+
+    area = ann.get("area")
+    if area is not None:
+        try:
+            a = float(area)
+            if np.isfinite(a) and a > 0:
+                return a
+        except Exception:
+            pass
+
+    return -1.0
+
+
+def select_one_annotation_per_image(annotations):
+    """Keep exactly one annotation per image to avoid ambiguous projection association."""
+    best = {}
+    best_score = {}
+    for ann in annotations:
+        img_id = ann.get("image_id")
+        if img_id is None:
+            continue
+        sc = _annotation_selection_score(ann)
+        if (img_id not in best) or (sc > best_score[img_id]):
+            best[img_id] = ann
+            best_score[img_id] = sc
+
+    selected = []
+    seen = set()
+    for ann in annotations:
+        img_id = ann.get("image_id")
+        if img_id is None or img_id in seen:
+            continue
+        chosen = best.get(img_id)
+        if chosen is not None:
+            selected.append(chosen)
+            seen.add(img_id)
+    return selected
+
+
 def resolve_num_face_keypoints(coco, requested_num_face_keypoints=None):
     supported_counts = sorted(GLASSES_TO_FACE_IDXS_BY_FACE_KPTS)
     supported_set = set(supported_counts)
@@ -433,7 +483,34 @@ def draw_landmarks_with_indices(img, kpts, color=(0, 255, 0), idxs=None):
     return im
 
 
-def coco_bbox_from_visible_keypoints(kpts, image_width: int, image_height: int, min_size: float = 1.0):
+def draw_bbox_on_image(img, bbox, color=(255, 255, 0), width=2):
+    """Draw a COCO-format bbox [x, y, w, h] on an image.
+    
+    Args:
+        img: PIL Image
+        bbox: [x, y, w, h] in COCO format
+        color: RGB tuple for the box outline
+        width: line width in pixels
+    
+    Returns:
+        PIL Image with bbox drawn
+    """
+    im = img.copy()
+    draw = ImageDraw.Draw(im)
+    x, y, w, h = bbox
+    x0, y0 = float(x), float(y)
+    x1, y1 = x0 + float(w), y0 + float(h)
+    draw.rectangle([x0, y0, x1, y1], outline=color, width=width)
+    return im
+
+
+def coco_bbox_from_visible_keypoints(
+    kpts,
+    image_width: int,
+    image_height: int,
+    min_size: float = 1.0,
+    margin_px: float = 0.0,
+):
     """Compute a COCO bbox [x,y,w,h] from visible keypoints.
 
     Expects keypoints as an iterable of (x, y, v). Uses only points with v > 0.
@@ -459,6 +536,13 @@ def coco_bbox_from_visible_keypoints(kpts, image_width: int, image_height: int, 
     y0 = max(0.0, min(ys))
     x1 = min(float(image_width), max(xs))
     y1 = min(float(image_height), max(ys))
+
+    m = max(0.0, float(margin_px))
+    if m > 0.0:
+        x0 = max(0.0, x0 - m)
+        y0 = max(0.0, y0 - m)
+        x1 = min(float(image_width), x1 + m)
+        y1 = min(float(image_height), y1 + m)
 
     w = max(float(min_size), float(x1 - x0))
     h = max(float(min_size), float(y1 - y0))
@@ -548,10 +632,31 @@ def _get_pnp_correspondences(landmarks_2d):
     return np.asarray(obj_pts, dtype=np.float32), np.asarray(img_pts, dtype=np.float32)
 
 
+def _extract_euler_angles(R_mat: np.ndarray):
+    """Extract Euler angles (roll, pitch, yaw) from rotation matrix.
+    
+    Returns: (roll_deg, pitch_deg, yaw_deg)
+    """
+    sy = math.sqrt(R_mat[0, 0] ** 2 + R_mat[1, 0] ** 2)
+    
+    singular = sy < 1e-6
+    
+    if not singular:
+        roll = math.degrees(math.atan2(R_mat[2, 1], R_mat[2, 2]))
+        pitch = math.degrees(math.atan2(-R_mat[2, 0], sy))
+        yaw = math.degrees(math.atan2(R_mat[1, 0], R_mat[0, 0]))
+    else:
+        roll = math.degrees(math.atan2(-R_mat[1, 2], R_mat[1, 1]))
+        pitch = math.degrees(math.atan2(-R_mat[2, 0], sy))
+        yaw = 0.0
+    
+    return roll, pitch, yaw
+
+
 def estimate_glasses_pose_pnp(landmarks_2d, image_width, image_height):
     obj_pts, img_pts = _get_pnp_correspondences(landmarks_2d)
     if obj_pts is None:
-        return False, None, None, None, None, None
+        return False, None, None, None, None, None, False, None, None, None
 
     f = float(max(image_width, image_height))
     cx = float(image_width) / 2.0
@@ -568,7 +673,7 @@ def estimate_glasses_pose_pnp(landmarks_2d, image_width, image_height):
     try:
         success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=flag)
     except cv2.error:
-        return False, None, None, None, None, None
+        return False, None, None, None, None, None, False, None, None, None
 
     # Reprojection error helper
     pts_3d = obj_pts.reshape(-1, 3)
@@ -590,10 +695,44 @@ def estimate_glasses_pose_pnp(landmarks_2d, image_width, image_height):
     tvec2 = (Rx_pi @ t_vec).reshape(3, 1)
     err_flip = reproj_err(rvec2, tvec2)
 
+    is_flipped = False
     if err_flip + 1e-6 < err_orig:
         rvec, tvec = rvec2, tvec2
+        is_flipped = True
 
-    return True, rvec.astype(np.float32), tvec.astype(np.float32), K.astype(np.float32), obj_pts, img_pts
+    # Extract Euler angles for logging
+    R_mat_final, _ = cv2.Rodrigues(rvec)
+    roll, pitch, yaw = _extract_euler_angles(R_mat_final)
+
+    return True, rvec.astype(np.float32), tvec.astype(np.float32), K.astype(np.float32), obj_pts, img_pts, is_flipped, float(roll), float(pitch), float(yaw)
+
+
+def is_roll_in_allowed_range(roll_deg: float) -> bool:
+    """Allowed roll range: [90,180] or [-180,-90]."""
+    r = float(roll_deg)
+    return (90.0 <= r <= 180.0) or (-180.0 <= r <= -90.0)
+
+
+def are_all_landmarks_inside_image(kpts, image_width: int, image_height: int) -> bool:
+    """Return True only if every landmark is visible, finite, and strictly inside image bounds."""
+    w = float(image_width)
+    h = float(image_height)
+    if w <= 0 or h <= 0:
+        return False
+
+    for kp in kpts:
+        if kp is None or len(kp) < 3:
+            return False
+        x, y, v = kp[0], kp[1], kp[2]
+        if float(v) <= 0:
+            return False
+        if (not np.isfinite(x)) or (not np.isfinite(y)):
+            return False
+        xf = float(x)
+        yf = float(y)
+        if xf < 0.0 or xf >= w or yf < 0.0 or yf >= h:
+            return False
+    return True
 
 
 def project_glasses_keypoints_pnp(rvec, tvec, K, image_width, image_height, kp_indices=None, visibility=2):
@@ -850,8 +989,7 @@ def downsample_rgba(img: Image.Image, out_w: int, out_h: int) -> Image.Image:
     return img.resize((int(out_w), int(out_h)), resampling)
 
 
-def debug_pnp_only(coco, image_by_id, images_root: Path, out_images_root: Path, num_face_kpts: int):
-    annots = coco.get("annotations", [])
+def debug_pnp_only(annots, image_by_id, images_root: Path, out_images_root: Path, num_face_kpts: int):
     if not annots:
         print("No annotations found; nothing to run PnP on.")
         return
@@ -872,18 +1010,26 @@ def debug_pnp_only(coco, image_by_id, images_root: Path, out_images_root: Path, 
             continue
 
         w, h = int(img_info["width"]), int(img_info["height"])
-        ok, rvec, tvec, K, _, _ = estimate_glasses_pose_pnp(landmarks_2d, w, h)
+        ok, rvec, tvec, K, _, _, is_flipped, roll, pitch, yaw = estimate_glasses_pose_pnp(landmarks_2d, w, h)
         if not ok:
             print(f"[PnP-only] PnP failed: {img_path}")
             continue
 
         proj_kpts = project_glasses_keypoints_pnp(rvec, tvec, K, w, h)
+        if not are_all_landmarks_inside_image(proj_kpts, w, h):
+            print(f"[PnP-only] Discarding {img_path} because projected landmarks are outside image")
+            continue
 
         img = Image.open(img_path).convert("RGB")
         orig_kpts = np.asarray(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
         img_dbg = draw_landmarks_with_indices(img, orig_kpts.tolist(), color=(0, 255, 0))
         full_idxs = list(range(GLASSES_3D_LANDMARKS.shape[0]))
         img_dbg = draw_landmarks_with_indices(img_dbg, proj_kpts, color=(255, 0, 0), idxs=full_idxs)
+        
+        # Draw bbox recomputed from projected glasses keypoints
+        bbox_dbg = coco_bbox_from_visible_keypoints(proj_kpts, w, h, min_size=1.0, margin_px=5.0)
+        if bbox_dbg is not None:
+            img_dbg = draw_bbox_on_image(img_dbg, bbox_dbg, color=(255, 255, 0), width=2)
 
         out_name = f"{Path(img_info['file_name']).stem}_pnp_debug.jpg"
         out_path = out_images_root / out_name
@@ -928,18 +1074,25 @@ def main():
 
     images = coco.get("images", [])
     annotations = coco.get("annotations", [])
+    selected_annotations = select_one_annotation_per_image(annotations)
     categories = coco.get("categories", [])
+
+    if len(selected_annotations) != len(annotations):
+        print(
+            f"Selected {len(selected_annotations)} annotation(s) from {len(annotations)} total "
+            "(one per image; largest bbox/area kept)."
+        )
 
     image_by_id = {img["id"]: img for img in images}
 
     # If requested, run PnP-only debug mode and exit.
     if args.pnp_only:
         print("Running PnP-only debug mode (no Blender rendering)...")
-        debug_pnp_only(coco, image_by_id, images_root, out_images_root, num_face_keypoints)
+        debug_pnp_only(selected_annotations, image_by_id, images_root, out_images_root, num_face_keypoints)
         return
 
     # Prepare COCO output category keypoints
-    used_category_ids = {a.get("category_id") for a in annotations if "category_id" in a}
+    used_category_ids = {a.get("category_id") for a in selected_annotations if "category_id" in a}
     n_out_kpts = int(len(glasses_output_idxs))
     new_kpt_names = [f"kpt_{i}" for i in range(n_out_kpts)]
     if categories:
@@ -978,7 +1131,7 @@ def main():
 
     pose_log = []
 
-    for ann in annotations:
+    for ann in selected_annotations:
         img = image_by_id.get(ann["image_id"])
         if img is None:
             continue
@@ -1003,52 +1156,37 @@ def main():
         s_w = 1.0
         t_w = np.zeros(2, dtype=np.float32)
 
-        ok, rvec_pnp, tvec_pnp, K_pnp, obj_pts_pnp, img_pts_pnp = estimate_glasses_pose_pnp(landmarks_2d, w, h)
+        ok, rvec_pnp, tvec_pnp, K_pnp, obj_pts_pnp, img_pts_pnp, is_pnp_flipped, roll_pnp, pitch_pnp, yaw_pnp = estimate_glasses_pose_pnp(landmarks_2d, w, h)
         if ok:
+            if not is_roll_in_allowed_range(roll_pnp):
+                print(
+                    f"[PnP] Discarding {img['file_name']} due to roll outside allowed range: "
+                    f"roll={roll_pnp:.2f}"
+                )
+                pose_log.append({
+                    "image": img["file_name"],
+                    "method": "pnp",
+                    "roll": float(roll_pnp),
+                    "pitch": float(pitch_pnp),
+                    "yaw": float(yaw_pnp),
+                    "discarded": True,
+                    "reason": "roll_out_of_allowed_range",
+                })
+                continue
+
             pnp_ok = True
             rvec, tvec, K = rvec_pnp, tvec_pnp, K_pnp
             obj_pts, img_pts = obj_pts_pnp, img_pts_pnp
+            rx, ry, rz = float(roll_pnp), float(pitch_pnp), float(yaw_pnp)
 
-            # log euler + degenerate roll discard similar to your script
-            try:
-                R_mat, _ = cv2.Rodrigues(rvec)
-                sy = math.sqrt(R_mat[0, 0] ** 2 + R_mat[1, 0] ** 2)
-                if sy < 1e-6:
-                    rx = math.degrees(math.atan2(-R_mat[1, 2], R_mat[1, 1]))
-                    ry = math.degrees(math.atan2(-R_mat[2, 0], sy))
-                    rz = 0.0
-                else:
-                    rx = math.degrees(math.atan2(R_mat[2, 1], R_mat[2, 2]))
-                    ry = math.degrees(math.atan2(-R_mat[2, 0], sy))
-                    rz = math.degrees(math.atan2(R_mat[1, 0], R_mat[0, 0]))
-
-                threshold_deg = 30.0
-                if abs(rx) < threshold_deg:
-                    print(f"[PnP] Discarding {img['file_name']} due to degenerate roll={rx:.1f}°")
-                    pose_log.append({
-                        "image": img["file_name"],
-                        "method": "pnp",
-                        "roll": float(rx), "pitch": float(ry), "yaw": float(rz),
-                        "tvec": tvec.flatten().tolist(),
-                        "discarded": True,
-                    })
-                    continue
-
-                print(f"[PnP] {img['file_name']}: roll={rx:.1f} pitch={ry:.1f} yaw={rz:.1f} tvec={tvec.flatten().tolist()}")
-                pose_log.append({
-                    "image": img["file_name"],
-                    "method": "pnp",
-                    "roll": float(rx), "pitch": float(ry), "yaw": float(rz),
-                    "tvec": tvec.flatten().tolist(),
-                    "discarded": False,
-                })
-            except Exception:
-                pose_log.append({
-                    "image": img["file_name"],
-                    "method": "pnp",
-                    "tvec": tvec.flatten().tolist(),
-                    "discarded": False,
-                })
+            print(f"[PnP] {img['file_name']}: roll={rx:.1f}° pitch={ry:.1f}° yaw={rz:.1f}° tvec={tvec.flatten().tolist()}")
+            pose_log.append({
+                "image": img["file_name"],
+                "method": "pnp",
+                "roll": rx, "pitch": ry, "yaw": rz,
+                "tvec": tvec.flatten().tolist(),
+                "discarded": False,
+            })
 
             glasses_kpts = project_glasses_keypoints_pnp(
                 rvec, tvec, K, w, h, kp_indices=glasses_output_idxs
@@ -1068,6 +1206,16 @@ def main():
                 "t": [float(x) for x in t_w.tolist()],
                 "discarded": False,
             })
+
+        if not are_all_landmarks_inside_image(glasses_kpts, w, h):
+            print(f"[Pose] Discarding {img['file_name']} because projected landmarks are outside image")
+            pose_log.append({
+                "image": img["file_name"],
+                "method": "pnp" if pnp_ok else "weak",
+                "discarded": True,
+                "reason": "landmarks_outside_image",
+            })
+            continue
 
         # Create variants
         for v in range(int(max(1, args.variants_per_image))):
@@ -1226,6 +1374,10 @@ def main():
                 orig_kpts_local = np.asarray(t["ann"]["keypoints"], dtype=np.float32).reshape(-1, 3)
                 comp_dbg = draw_landmarks_with_indices(comp, orig_kpts_local.tolist(), color=(0, 255, 0))
                 comp_dbg = draw_landmarks_with_indices(comp_dbg, t["proj_kpts"], color=(255, 0, 0), idxs=GLASSES_KEYPOINT_IDXS)
+                # Draw recomputed bbox from projected glasses keypoints on debug image
+                bbox_dbg = coco_bbox_from_visible_keypoints(t["proj_kpts"], t["w"], t["h"], min_size=1.0, margin_px=5.0)
+                if bbox_dbg is not None:
+                    comp_dbg = draw_bbox_on_image(comp_dbg, bbox_dbg, color=(255, 255, 0), width=2)
                 comp_dbg.save(t["out_img_path"] + ".kpts.jpg", quality=90)
             except Exception as e:
                 print(f"Warning: failed to save composite debug overlay: {e}")
@@ -1254,7 +1406,7 @@ def main():
 
         # bbox/area: optionally recompute from projected glasses landmarks
         if args.bbox_from_glasses_landmarks:
-            bbox = coco_bbox_from_visible_keypoints(t["proj_kpts"], t["w"], t["h"], min_size=1.0)
+            bbox = coco_bbox_from_visible_keypoints(t["proj_kpts"], t["w"], t["h"], min_size=1.0, margin_px=5.0)
             if bbox is not None:
                 new_ann["bbox"] = bbox
                 new_ann["area"] = float(bbox[2] * bbox[3])
