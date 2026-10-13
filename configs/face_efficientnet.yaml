@@ -48,6 +48,22 @@ data:
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
 
+  primary_test: hmd_xreal
+  test_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/test.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+  test_aug:
+    enabled: false
+    use_bbox_crop: false
+    face_margin: 0.25
+
+  metrics:
+    pck_threshold: 0.05
+    nme_interocular_indices: [0, 9]
+
   aug:
     enabled: true
     use_bbox_crop: false
@@ -119,6 +135,7 @@ train:
   ema:
     enabled: true
     decay: 0.9995
+    warmup: true
     update_every: 1
     eval: true
   num_val_viz: 4

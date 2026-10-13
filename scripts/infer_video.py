@@ -32,6 +32,7 @@ import torch
 import numpy as np
 
 from pose.engine.inference import decode_heatmaps
+from pose.engine.ema import ema_shadow_issues
 from pose.config import Config
 from pose.registry import MODEL_REGISTRY
 
@@ -419,27 +420,20 @@ def _load_model_from_config(
         return bool(ema_cfg.get("eval", True))
 
     if ema_shadow is not None and _should_use_ema():
-        # `ema_shadow` is a dict of parameter tensors only (Trainer.ModelEMA).
-        # Apply it the same way as Trainer does: copy matching parameters by name.
-        applied = 0
-        try:
-            for name, p in model.named_parameters():
-                if name not in ema_shadow:
-                    continue
-                if not torch.is_floating_point(p.data):
-                    continue
-                src = ema_shadow[name]
-                if not isinstance(src, torch.Tensor):
-                    continue
-                if src.device != p.device:
-                    src = src.to(device=p.device)
-                p.data.copy_(src)
-                applied += 1
-        except Exception as e:
-            print(f"[WARN] Failed to apply EMA shadow weights: {e}")
+        missing, unexpected, incompatible = ema_shadow_issues(model, ema_shadow)
+        if missing or unexpected or incompatible:
+            mode = str(ema_mode).lower().strip() if ema_mode is not None else "auto"
+            message = (
+                "EMA state is incomplete "
+                f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+                f"incompatible={len(incompatible)})"
+            )
+            if mode == "on":
+                raise ValueError(f"{message}; refusing forced EMA inference")
+            print(f"[WARN] {message}; using raw model weights")
         else:
-            if applied > 0:
-                print(f"Using EMA weights for inference (applied {applied} params)")
+            model.load_state_dict(ema_shadow, strict=True)
+            print("Using complete EMA model state for inference")
 
     model.to(device)
     model.eval()
@@ -588,11 +582,9 @@ def load_detector_from_config(*, config_path: str, checkpoint_path: str, device:
         fallback_num_keypoints=0,
         weights_only=True,
         strict=False,
-        # Use non-EMA weights for detector, matching scripts/infer_bbox.py.
-        # The EMA shadow for bbox models is typically incomplete (missing BN
-        # buffers), so infer_bbox falls back to ckpt['model'].  Using the
-        # partial EMA overlay produces a tighter / shifted box.
-        ema_mode="off",
+        # Auto mode uses complete v2 EMA states and safely rejects legacy
+        # parameter-only EMA checkpoints.
+        ema_mode="auto",
     )
 
     det_input_size = _get_cfg_input_size(det_cfg, fallback=(192, 192))

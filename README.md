@@ -126,8 +126,14 @@ train:
   ema:
     enabled: true
     decay: 0.999
+    warmup: true  # ramp decay during early updates
     eval: true
 ```
+
+EMA checkpoints include the complete model state, including BatchNorm running
+statistics. Legacy parameter-only EMA checkpoints are detected during testing,
+inference, and export; `auto` mode safely falls back to the checkpoint's raw
+model weights instead of applying an incomplete EMA state.
 
 ### Run inference:
 
@@ -497,6 +503,32 @@ python scripts/infer.py --config configs/xreal_mobilenet.yaml --checkpoint work_
 ```
 
 Result saved as `debug_out.png`.
+
+### Test-set metrics
+
+Define one or more held-out datasets in the YAML using the same fields as a
+validation dataset:
+
+```yaml
+data:
+  primary_test: hmd_xreal
+  test_datasets:
+    - name: hmd_xreal
+      json_path: datasets/hmd_xreal/annotations/test.json
+      image_root: datasets/hmd_xreal/images
+      weight: 1.0
+```
+
+Then evaluate a checkpoint with:
+
+```bash
+python scripts/test.py --config configs/xreal_mobilenet.yaml --checkpoint work_dirs/xreal_mobilenet/best.pth --output outputs/test_metrics.json
+```
+
+The command reports loss, PCK, and NME for every configured test dataset. PCK
+defaults to 5% of the input-image diagonal; NME uses keypoints 36 and 45 as the
+inter-ocular normalizer for 68-point annotations. These can be changed with
+`data.metrics.pck_threshold` and `data.metrics.nme_interocular_indices`.
 
 ---
 

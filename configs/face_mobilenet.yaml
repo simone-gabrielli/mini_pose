@@ -7,7 +7,7 @@ data:
 
   batch_size: 16
   val_batch_size: 16
-  num_workers: 0
+  num_workers: 4
 
   train_datasets:
     - name: hmd_xreal
@@ -32,6 +32,22 @@ data:
       json_path: "datasets/300W-xreal_air2/annotations/val.json"
       image_root: "datasets/300W-xreal_air2"
       weight: 0.2
+
+  primary_test: hmd_xreal
+  test_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/test.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+  test_aug:
+    enabled: false
+    use_bbox_crop: false
+    face_margin: 0.25
+
+  metrics:
+    pck_threshold: 0.05
+    nme_interocular_indices: [0, 9]
 
   aug:
     enabled: true
@@ -90,7 +106,7 @@ loss:
   bbox_loss: smooth_l1
 
 train:
-  epochs: 100
+  epochs: 200
   optimizer:
     name: adamw
     lr: 0.0003
@@ -105,9 +121,10 @@ train:
     enabled: true
     dtype: fp16
   ema:
-    enabled: false
+    enabled: true
     decay: 0.999
+    warmup: true
     update_every: 1
     eval: true
-  num_val_viz: 4
+  num_val_viz: 10
   output_dir: "work_dirs/face_mobilenet"

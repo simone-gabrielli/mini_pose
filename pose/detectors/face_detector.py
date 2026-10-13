@@ -4,6 +4,7 @@ import torchvision
 import numpy as np
 import os
 from pose.registry import register_model
+from pose.engine.ema import ema_shadow_issues
 
 
 @register_model("tiny_face")
@@ -349,26 +350,14 @@ def load_tiny_face_detector(checkpoint_path, device=None):
             if isinstance(shadow, dict) and shadow:
                 ema_shadow = _strip_module_prefix(shadow)
     if isinstance(ema_shadow, dict) and ema_shadow:
-        applied = 0
-        for name, p in model.named_parameters():
-            if name not in ema_shadow:
-                continue
-            t = ema_shadow.get(name)
-            if not isinstance(t, torch.Tensor):
-                continue
-            if not torch.is_floating_point(p.data):
-                continue
-            if t.device != p.device:
-                t = t.to(device=p.device)
-            if t.dtype != p.dtype:
-                t = t.to(dtype=p.dtype)
-            try:
-                p.data.copy_(t)
-                applied += 1
-            except Exception:
-                continue
-        if applied > 0:
-            # Keep output minimal; loader may be used in training scripts too.
-            pass
+        missing, unexpected, incompatible = ema_shadow_issues(model, ema_shadow)
+        if missing or unexpected or incompatible:
+            print(
+                "[WARN] Ignoring incomplete EMA state "
+                f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+                f"incompatible={len(incompatible)}); using raw detector weights"
+            )
+        else:
+            model.load_state_dict(ema_shadow, strict=True)
 
     return model

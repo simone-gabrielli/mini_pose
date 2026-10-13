@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
-import matplotlib.pyplot as plt
 
 from pose.data.heatmap import generate_heatmaps
 from pose.registry import register_dataset

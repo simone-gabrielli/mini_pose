@@ -24,64 +24,107 @@ import os
 import shutil
 from contextlib import contextmanager, nullcontext
 from typing import Dict, Any
+import matplotlib
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
 class ModelEMA:
-    """Exponential Moving Average (EMA) of model parameters.
+    """Exponential Moving Average (EMA) of the complete model state.
 
-    Keeps a shadow copy of parameters updated as:
+    Floating-point parameters and buffers are updated as:
         ema = decay * ema + (1 - decay) * param
 
-    Designed for easy evaluation via a temporary weight swap.
+    Non-floating buffers (for example BatchNorm ``num_batches_tracked``) are
+    copied directly. A short decay warmup prevents a high configured decay from
+    leaving early EMA checkpoints too close to model initialization.
     """
 
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999, device: torch.device | None = None):
+    FORMAT_VERSION = 2
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        decay: float = 0.999,
+        device: torch.device | None = None,
+        warmup: bool = True,
+    ):
         self.decay = float(decay)
         self._shadow: dict[str, torch.Tensor] = {}
         self._device = device
+        self.warmup = bool(warmup)
+        self.num_updates = 0
+        self._loaded_complete = True
 
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
+        for name, value in model.state_dict().items():
+            if not isinstance(value, torch.Tensor):
                 continue
-            if not torch.is_floating_point(p.data):
-                continue
-            t = p.detach().clone()
+            t = value.detach().clone()
             if device is not None:
                 t = t.to(device=device)
             self._shadow[name] = t
 
+    @property
+    def is_complete(self) -> bool:
+        return bool(self._loaded_complete)
+
+    def _effective_decay(self) -> float:
+        if not self.warmup:
+            return self.decay
+        # Common EMA ramp: responsive at startup, asymptotically approaching
+        # the configured decay as training stabilizes.
+        ramp = (1.0 + float(self.num_updates)) / (10.0 + float(self.num_updates))
+        return min(self.decay, ramp)
+
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
-        d = self.decay
-        for name, p in model.named_parameters():
-            if name not in self._shadow:
+        self.num_updates += 1
+        d = self._effective_decay()
+        model_state = model.state_dict()
+        for name, value in model_state.items():
+            if not isinstance(value, torch.Tensor):
                 continue
-            if not torch.is_floating_point(p.data):
-                continue
-            src = p.detach()
+            src = value.detach()
             if self._device is not None:
                 src = src.to(device=self._device)
-            self._shadow[name].mul_(d).add_(src, alpha=(1.0 - d))
+            if name not in self._shadow or self._shadow[name].shape != src.shape:
+                self._shadow[name] = src.clone()
+                continue
+            if torch.is_floating_point(src) or torch.is_complex(src):
+                self._shadow[name].mul_(d).add_(src, alpha=(1.0 - d))
+            else:
+                self._shadow[name].copy_(src)
+        self._loaded_complete = set(model_state.keys()) == set(self._shadow.keys())
 
     def state_dict(self) -> dict:
         return {
+            "format_version": self.FORMAT_VERSION,
             "decay": self.decay,
+            "warmup": self.warmup,
+            "num_updates": self.num_updates,
             "shadow": {k: v.detach().cpu() for k, v in self._shadow.items()},
         }
 
-    def load_state_dict(self, state: dict):
+    def load_state_dict(self, state: dict, model: torch.nn.Module | None = None) -> bool:
         if not isinstance(state, dict):
-            return
+            self._loaded_complete = False
+            return False
         if "decay" in state:
             self.decay = float(state["decay"])
+        if "warmup" in state:
+            self.warmup = bool(state["warmup"])
+        self.num_updates = int(state.get("num_updates", 0))
         shadow = state.get("shadow")
         if not isinstance(shadow, dict):
-            return
+            self._loaded_complete = False
+            return False
+
+        loaded_keys: set[str] = set()
         for k, v in shadow.items():
             if k not in self._shadow:
                 continue
@@ -92,34 +135,55 @@ class ModelEMA:
                 if self._device is not None:
                     t = t.to(device=self._device)
                 else:
-                    # keep on current model device if available
                     t = t.to(device=self._shadow[k].device)
                 self._shadow[k].copy_(t)
+                loaded_keys.add(k)
             except Exception:
                 continue
 
+        expected_keys = set(self._shadow.keys())
+        self._loaded_complete = loaded_keys == expected_keys
+
+        # Legacy checkpoints contain parameters only. Seed their missing buffers
+        # from the checkpoint's base model state, then require at least one EMA
+        # update before treating the resumed shadow as complete for evaluation.
+        if model is not None and not self._loaded_complete:
+            for name, value in model.state_dict().items():
+                if name in loaded_keys or name not in self._shadow:
+                    continue
+                source = value.detach()
+                if self._device is not None:
+                    source = source.to(device=self._device)
+                else:
+                    source = source.to(device=self._shadow[name].device)
+                self._shadow[name].copy_(source)
+        return self._loaded_complete
+
     @contextmanager
     def apply_to(self, model: torch.nn.Module):
-        """Temporarily copy EMA weights into model parameters."""
+        """Temporarily copy the complete EMA state into ``model``."""
+        if not self._loaded_complete:
+            raise RuntimeError("EMA state is incomplete; refusing to mix it with live model buffers")
+
         backup: dict[str, torch.Tensor] = {}
+        model_state = model.state_dict()
         try:
-            for name, p in model.named_parameters():
-                if name not in self._shadow:
-                    continue
-                if not torch.is_floating_point(p.data):
-                    continue
-                backup[name] = p.detach().clone()
-                src = self._shadow[name]
-                # If EMA is stored on CPU, copy to param device.
-                if src.device != p.device:
-                    src = src.to(device=p.device)
-                p.data.copy_(src)
+            with torch.no_grad():
+                for name, destination in model_state.items():
+                    if name not in self._shadow:
+                        continue
+                    backup[name] = destination.detach().clone()
+                    source = self._shadow[name]
+                    if source.device != destination.device:
+                        source = source.to(device=destination.device)
+                    destination.copy_(source)
             yield
         finally:
-            for name, p in model.named_parameters():
-                if name not in backup:
-                    continue
-                p.data.copy_(backup[name].to(device=p.device))
+            with torch.no_grad():
+                for name, destination in model_state.items():
+                    if name not in backup:
+                        continue
+                    destination.copy_(backup[name].to(device=destination.device))
 
 import pose.data      # noqa: F401  # ensures datasets register
 import pose.models    # noqa: F401  # ensures models register
@@ -508,6 +572,7 @@ class Trainer:
         self.use_ema = bool(ema_cfg.get("enabled", False))
         self.ema_eval = bool(ema_cfg.get("eval", True))
         self.ema_decay = float(ema_cfg.get("decay", 0.999))
+        self.ema_warmup = bool(ema_cfg.get("warmup", True))
         self.ema_device = ema_cfg.get("device", None)
         if isinstance(self.ema_device, str):
             self.ema_device = torch.device(self.ema_device)
@@ -517,7 +582,17 @@ class Trainer:
         if self.ema_update_every < 1:
             self.ema_update_every = 1
 
-        self.ema = ModelEMA(self.model, decay=self.ema_decay, device=self.ema_device) if self.use_ema else None
+        self.ema = (
+            ModelEMA(
+                self.model,
+                decay=self.ema_decay,
+                device=self.ema_device,
+                warmup=self.ema_warmup,
+            )
+            if self.use_ema
+            else None
+        )
+        self._warned_incomplete_ema = False
 
         self.epochs = train_cfg["epochs"]
         self.output_dir = train_cfg.get("output_dir", "work_dirs")
@@ -719,6 +794,7 @@ class Trainer:
 
         coord_preds: list[np.ndarray] = []
         coord_targets: list[np.ndarray] = []
+        coord_visible: list[np.ndarray] = []
         conf_vals: list[np.ndarray] = []
         norm_err_vals: list[np.ndarray] = []
         is_coord_regression = loss_name in coord_regression_losses
@@ -727,7 +803,11 @@ class Trainer:
         det_iou_n = 0
 
         # Optionally evaluate EMA weights.
-        eval_ctx = self.ema.apply_to(self.model) if (self.ema is not None and self.ema_eval) else nullcontext()
+        use_eval_ema = self.ema is not None and self.ema_eval and self.ema.is_complete
+        if self.ema is not None and self.ema_eval and not self.ema.is_complete and not self._warned_incomplete_ema:
+            print("[WARN] EMA state is incomplete; evaluating raw model weights instead.")
+            self._warned_incomplete_ema = True
+        eval_ctx = self.ema.apply_to(self.model) if use_eval_ema else nullcontext()
 
         with eval_ctx:
             for batch in pbar:
@@ -825,6 +905,7 @@ class Trainer:
                         t_np = targets_2d[b].cpu().numpy()
                         coord_preds.append(p_np)
                         coord_targets.append(t_np)
+                        coord_visible.append(visible[b].detach().cpu().numpy())
 
                         if pred_confidence is not None:
                             c_np = pred_confidence[b].detach().cpu().numpy().astype(np.float32)
@@ -888,6 +969,7 @@ class Trainer:
 
                         t = batch["keypoints"][b].cpu().numpy()[:, :2]
                         coord_targets.append(np.stack([t[:, 0] * sx, t[:, 1] * sy], axis=1))
+                        coord_visible.append(batch["visible"][b].cpu().numpy())
 
                 running_loss += float(loss.item())
                 pbar.set_postfix(loss=float(loss.item()))
@@ -908,8 +990,26 @@ class Trainer:
             try:
                 coord_preds_arr = np.stack(coord_preds)
                 coord_targets_arr = np.stack(coord_targets)
-                metrics["pck"] = float(compute_pck(coord_preds_arr, coord_targets_arr))
-                metrics["nme"] = float(compute_nme(coord_preds_arr, coord_targets_arr))
+                coord_visible_arr = np.stack(coord_visible)
+                metric_cfg = self.cfg.get("data", {}).get("metrics", {}) or {}
+                pck_thresh = float(metric_cfg.get("pck_threshold", 0.05))
+                nme_indices = tuple(metric_cfg.get("nme_interocular_indices", [36, 45]))
+                coordinate_size = (
+                    dataset.input_size if is_coord_regression else dataset.heatmap_size
+                )
+                metrics["pck"] = float(compute_pck(
+                    coord_preds_arr,
+                    coord_targets_arr,
+                    thresh=pck_thresh,
+                    image_size=coordinate_size,
+                    visible=coord_visible_arr,
+                ))
+                metrics["nme"] = float(compute_nme(
+                    coord_preds_arr,
+                    coord_targets_arr,
+                    visible=coord_visible_arr,
+                    interocular_indices=nme_indices,
+                ))
             except Exception:
                 pass
 
@@ -1093,7 +1193,7 @@ class Trainer:
         viz_root = os.path.join(self.output_dir, "viz")
         os.makedirs(viz_root, exist_ok=True)
 
-        num_vis_cfg = int(self.cfg.get("train", {}).get("num_val_viz", 4))
+        num_vis_cfg = int(self.cfg.get("train", {}).get("num_val_viz", 10))
         if num_vis_cfg < 0:
             num_vis_cfg = 0
 
@@ -1146,7 +1246,12 @@ class Trainer:
         # 2.7) EMA state
         if "ema" in ckpt and self.ema is not None:
             try:
-                self.ema.load_state_dict(ckpt["ema"])
+                complete = self.ema.load_state_dict(ckpt["ema"], model=self.model)
+                if not complete:
+                    print(
+                        "[WARN] Loaded a legacy parameter-only EMA state. Raw model weights "
+                        "will be used until training performs a new EMA update."
+                    )
             except Exception as e:
                 print(f"Warning: could not load EMA state ({e}); using fresh EMA.")
 

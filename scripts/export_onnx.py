@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from pose.config import Config
+from pose.engine.ema import ema_shadow_issues
 from pose.registry import MODEL_REGISTRY
 
 # Ensure model modules are imported so they register themselves in MODEL_REGISTRY
@@ -347,7 +348,19 @@ def main() -> None:
         return bool(ema_cfg.get("eval", True))
 
     if ema_shadow is not None and _should_use_ema():
-        model.load_state_dict(ema_shadow, strict=False)
+        missing, unexpected, incompatible = ema_shadow_issues(model, ema_shadow)
+        if missing or unexpected or incompatible:
+            mode = str(args.ema).lower().strip() if args.ema is not None else "auto"
+            message = (
+                "EMA state is incomplete "
+                f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+                f"incompatible={len(incompatible)})"
+            )
+            if mode == "on":
+                raise ValueError(f"{message}; refusing forced EMA export")
+            print(f"[WARN] {message}; exporting raw model weights")
+        else:
+            model.load_state_dict(ema_shadow, strict=True)
 
     model.eval()
     model.cpu()

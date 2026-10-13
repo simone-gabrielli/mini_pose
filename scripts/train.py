@@ -16,11 +16,16 @@ Notes:
 """
 
 import argparse
+import os
 import torch
 from pose.config import Config
-from pose.engine.trainer import Trainer
+
+# Training is headless; force a non-Tk backend before any pyplot import.
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 def main():
+    from pose.engine.trainer import Trainer
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--device", default="cuda")

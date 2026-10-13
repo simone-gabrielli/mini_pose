@@ -12,24 +12,65 @@ data:
   num_workers: 0
 
   train_datasets:
-    - name: 300w_xreal_air2
-      json_path: "datasets/300W-xreal_air2/annotations/train.json"
-      image_root: "datasets/300W-xreal_air2"
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/train.json"
+      image_root: "datasets/hmd_xreal/images"
       weight: 1.0
 
-  primary_val: 300w_xreal_air2
+    # - name: 300w_xreal_air2
+    #   json_path: "datasets/300W-xreal_air2/annotations/train.json"
+    #   image_root: "datasets/300W-xreal_air2"
+    #   weight: 0.4
+
+    - name: wflw_xreal_air2
+      json_path: "datasets/WFLW-xreal_air2/annotations/train.json"
+      image_root: "datasets/WFLW-xreal_air2"
+      weight: 0.3
+
+  # Multi-dataset validation.
+  primary_val: hmd_xreal
   val_datasets:
-    - name: 300w_xreal_air2
-      json_path: "datasets/300W-xreal_air2/annotations/val.json"
-      image_root: "datasets/300W-xreal_air2"
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/val.json"
+      image_root: "datasets/hmd_xreal/images"
       weight: 1.0
+
+    # - name: 300w_xreal_air2
+    #   json_path: "datasets/300W-xreal_air2/annotations/val.json"
+    #   image_root: "datasets/300W-xreal_air2"
+    #   weight: 0.2
+
+    - name: wflw_xreal_air2
+      json_path: "datasets/WFLW-xreal_air2/annotations/val.json"
+      image_root: "datasets/WFLW-xreal_air2"
+      weight: 0.2
+
+  # Held-out datasets used by scripts/test.py. Add more entries when their
+  # test.json files are available.
+  primary_test: hmd_xreal
+  test_datasets:
+    - name: hmd_xreal
+      json_path: "datasets/hmd_xreal/annotations/test.json"
+      image_root: "datasets/hmd_xreal/images"
+      weight: 1.0
+
+  # Test preprocessing is deterministic but keeps the same bbox crop geometry.
+  test_aug:
+    enabled: false
+    use_bbox_crop: true
+    face_margin: 0.75
+
+  metrics:
+    pck_threshold: 0.05
+    nme_interocular_indices: [0, 9]
 
   aug:
     enabled: true
     use_bbox_crop: true
-    face_margin: 0.5
+    face_margin: 0.75
     bbox_offset_p: 0.25
     bbox_offset_max_frac: 0.5
+    keep_oob_visible: true
     hflip_p: 0.5
     flip_pairs:
       - [0, 9]
@@ -65,9 +106,9 @@ data:
       - [64, 66]
       - [65, 67]
     rotation: 30
-    scale: 0.1
-    color_jitter: 0.10
-    aug_factor: 1
+    scale: 0.15
+    color_jitter: 0.15
+    aug_factor: 1.5
     content:
       brightness_contrast_p: 0.5
       sunflare_p: 0.1
@@ -95,10 +136,10 @@ data:
       max_aspect: 3.0
       fill_mode: random
 
-#   val_aug:
-#     enabled: false
-#     use_bbox_crop: true
-#     face_margin: 0.5
+  # val_aug:
+  #   enabled: false
+  #   use_bbox_crop: true
+  #   face_margin: 0.5
 
 model:
   name: mobilenet_pose
@@ -114,23 +155,25 @@ loss:
   name: heatmap_mse
 
 train:
-  epochs: 80
+  epochs: 200
   optimizer:
     name: adam
-    lr: 0.0005
+    lr: 0.0002
     weight_decay: 0.0001
   scheduler:
-    name: multistep
-    milestones: [40, 50]
-    gamma: 0.1
+    name: cosine
+    warmup_epochs: 5
+    warmup_start_factor: 0.1
+    min_lr: 0.0
   grad_clip_norm: 0.0
   amp:
-    enabled: false
+    enabled: true
     dtype: fp16
   ema:
-    enabled: false
+    enabled: true
     decay: 0.999
+    warmup: true
     update_every: 1
     eval: true
-  num_val_viz: 4
+  num_val_viz: 10
   output_dir: "work_dirs/xreal_mobilenet"

@@ -41,6 +41,7 @@ except Exception as e:  # pragma: no cover
 
 from pose.config import Config
 from pose.detectors.face_detector import TinyFaceDetector
+from pose.engine.ema import ema_shadow_issues
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,19 @@ def _load_tinyface_model(
         state_dict = _select_ema_shadow_state_dict(ckpt)
         if state_dict is None:
             print("[WARN] --ema requested but checkpoint has no EMA shadow; falling back to ckpt['model']")
+        else:
+            candidate = _strip_module_prefix(state_dict)
+            missing, unexpected, incompatible = ema_shadow_issues(model, candidate)
+            if missing or unexpected or incompatible:
+                message = (
+                    "EMA state is incomplete "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+                    f"incompatible={len(incompatible)})"
+                )
+                if ema_mode_n == "on":
+                    raise ValueError(f"{message}; refusing forced EMA inference")
+                print(f"[WARN] {message}; falling back to raw model weights")
+                state_dict = None
 
     if state_dict is None:
         state_dict = _extract_state_dict(ckpt)
@@ -273,16 +287,6 @@ def _load_tinyface_model(
     state_dict = _strip_module_prefix(state_dict)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=bool(strict))
-    if (missing or unexpected) and use_ema and ema_mode_n != "on":
-        # Some checkpoints store an EMA shadow that doesn't include all buffers/params.
-        # In auto mode, prefer the full non-EMA model weights in that case.
-        print(
-            f"[WARN] EMA shadow load incomplete (missing={len(missing)} unexpected={len(unexpected)}); "
-            "falling back to ckpt['model'] weights. Use --ema on to force EMA."
-        )
-        state_dict_full = _strip_module_prefix(_extract_state_dict(ckpt))
-        missing, unexpected = model.load_state_dict(state_dict_full, strict=bool(strict))
-
     if missing or unexpected:
         print(f"[WARN] TinyFace load missing={len(missing)} unexpected={len(unexpected)}")
 
